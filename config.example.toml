@@ -1,0 +1,55 @@
+[app]
+env = "production"
+use_guild_sync_for_dev = false
+dev_guild_id = 0
+stale_command_cleanup_guild_ids = []
+
+[bot]
+spam_dry_run = true
+ignore_bots = true
+ignore_guild_admins = true
+max_audit_content_len = 1800
+
+[control]
+admin_user_ids = []
+super_user_ids = []
+rule_deployer_user_ids = []
+rule_deployer_role_ids = []
+require_second_approver_for_ai = true
+
+[guilds]
+allowlist_enabled = true
+allowed_guild_ids = []
+
+[allowlists]
+user_ids = []
+role_ids = []
+channel_ids = []
+
+[audit]
+default_channel_id = 0
+channel_map = {}
+
+[enforcement]
+default_channel_id = 0
+channel_map = {}
+
+[reports]
+review_channel_id = 0
+false_positive_channel_ids = []
+validation_months = 3
+validation_master_guild_id = 0
+
+[features]
+disabled_commands_by_guild = {}
+
+[moderation.defaults]
+enable_deletion = false
+enable_escalation = false
+warn_threshold = 1
+timeout_threshold = 2
+kick_threshold = 3
+ban_threshold = 4
+timeout_minutes = 60
+
+[moderation.guild_overrides]

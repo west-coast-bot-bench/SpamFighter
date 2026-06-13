@@ -1,0 +1,12 @@
+services:
+  spamfighter:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./config.toml:/data/config.toml:ro
+      - ./spam_rules.toml:/data/spam_rules.toml
+      - ./domain_blocklists:/data/domain_blocklists
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

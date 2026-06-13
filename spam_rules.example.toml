@@ -1,0 +1,27 @@
+custom_rules = []
+
+[meta]
+schema_version = 1
+
+[artifacts]
+values = []
+
+[image_hashes]
+sha256 = []
+
+[hooks]
+ticket_words = []
+ticket_context = []
+ticket_contact = []
+anti_ticket = []
+giveaway_intent = []
+giveaway_item = []
+giveaway_contact = []
+anti_giveaway = []
+job_role = []
+job_remote = []
+job_pay = []
+job_tasks = []
+job_response = []
+academic_intent = []
+academic_contact = []
