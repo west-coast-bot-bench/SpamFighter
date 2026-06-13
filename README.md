@@ -116,3 +116,7 @@ SpamFighter can delete messages and take moderation actions such as timeouts, ki
 This project is licensed under the GNU General Public License v3.0. See `LICENSE` for details.
 
 This software is provided without warranty; see the GPL-3.0 license text for the full warranty disclaimer and limitation of liability.
+
+## Terms and Privacy
+
+See `TERMS.md` and `PRIVACY.md` for the public SpamFighter terms and privacy policy.
