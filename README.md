@@ -121,6 +121,7 @@ All admin commands are guild-only and gated to server admins, configured super-u
 2. Under **Bot**, create the bot user and copy the token (you'll put it in `.env` — never commit it).
 
 ![Create the application](docs/images/setup-01-create-app.png)
+![Create the application](docs/images/setup-01-create-app-env.png)
 
 ### 2. Enable intents
 
@@ -173,6 +174,8 @@ In your server, run:
 - `/spamfighter test-message` — try a sample against the detector.
 - Start in dry-run mode (see `config.example.toml`) and watch the audit channel before enabling deletion.
 
+
+- BUG DISCOVERED! WILL CORRECT THIS!
 ![Verify with a test message](docs/images/setup-05-verify.png)
 
 ## Reporting Spam (for members)
