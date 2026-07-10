@@ -2,9 +2,9 @@
 
 SpamFighter is a multi-guild Discord moderation bot focused on detecting and removing spam — with every global rule change gated behind human review.
 
-- **Invite the bot:** `https://discord.com/oauth2/authorize?client_id=1484281615419965440`
-- **Support / community server:** `https://discord.gg/FTRwVAZ`
-- **Source code:** `https://github.com/west-coast-bot-bench/SpamFighter`
+- **Invite the bot:** [Click Here to Add the Bot](https://discord.com/oauth2/authorize?client_id=1484281615419965440)
+- **Support / community server:** [Click Here to Join the Server](https://discord.gg/FTRwVAZ)
+- **Source code:** [GitHub Source Code Link](https://github.com/west-coast-bot-bench/SpamFighter)
 
 This repository is the sanitized public export: it contains the full bot engine and setup scaffolding, while private detector expressions, production rules, blocklists, databases, and credentials are intentionally excluded.
 
