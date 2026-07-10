@@ -5,3 +5,5 @@ tomli-w>=1.0,<2
 tomli>=2.0,<3; python_version < "3.11"
 PyNaCl>=1.6.2,<2
 psycopg[binary]>=3.2,<4
+Pillow>=10,<12
+ImageHash>=4.3,<5

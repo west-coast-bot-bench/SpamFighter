@@ -7,6 +7,7 @@ import concurrent.futures
 import contextlib
 import csv
 import hashlib
+import io
 import ipaddress
 import json
 import logging
@@ -22,7 +23,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Collection, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -38,6 +39,12 @@ try:
     import psycopg
 except ModuleNotFoundError:  # pragma: no cover
     psycopg = None  # type: ignore
+try:
+    import imagehash
+    from PIL import Image
+except ModuleNotFoundError:  # pragma: no cover
+    imagehash = None  # type: ignore
+    Image = None  # type: ignore
 
 MessageHistoryChannel = discord.TextChannel | discord.VoiceChannel
 MESSAGE_HISTORY_CHANNEL_TYPES = (discord.TextChannel, discord.VoiceChannel)
@@ -347,7 +354,7 @@ def parse_config_dict(raw: dict) -> Config:
     guild_overrides_raw = moderation_raw.get("guild_overrides", {})
 
     allowed_guild_ids = _to_int_set(guilds_raw.get("allowed_guild_ids", []))
-    allowlist_enabled = bool(guilds_raw.get("allowlist_enabled", bool(allowed_guild_ids)))
+    allowlist_enabled = bool(guilds_raw.get("allowlist_enabled", False))
 
     moderation_defaults = ModerationSettings(
         enable_deletion=bool(defaults_raw.get("enable_deletion", True)),
@@ -448,23 +455,28 @@ def validate_thresholds(settings: ModerationSettings, *, where: str) -> None:
         raise ValueError(f"{where}: timeout_minutes must be positive")
 
 
+def apply_moderation_override(settings: ModerationSettings, override: Optional[ModerationOverride]) -> ModerationSettings:
+    if override is None:
+        return settings
+
+    return ModerationSettings(
+        enable_deletion=settings.enable_deletion if override.enable_deletion is None else override.enable_deletion,
+        enable_escalation=settings.enable_escalation if override.enable_escalation is None else override.enable_escalation,
+        warn_threshold=settings.warn_threshold if override.warn_threshold is None else override.warn_threshold,
+        timeout_threshold=settings.timeout_threshold if override.timeout_threshold is None else override.timeout_threshold,
+        kick_threshold=settings.kick_threshold if override.kick_threshold is None else override.kick_threshold,
+        ban_threshold=settings.ban_threshold if override.ban_threshold is None else override.ban_threshold,
+        timeout_minutes=settings.timeout_minutes if override.timeout_minutes is None else override.timeout_minutes,
+    )
+
+
 def resolve_moderation_settings(guild_id: int, *, config: Optional[Config] = None) -> ModerationSettings:
     source_config = CONFIG if config is None else config
     defaults = source_config.moderation.defaults
-    override = source_config.moderation.guild_overrides.get(guild_id)
-
-    if override is None:
-        return defaults
-
-    return ModerationSettings(
-        enable_deletion=defaults.enable_deletion if override.enable_deletion is None else override.enable_deletion,
-        enable_escalation=defaults.enable_escalation if override.enable_escalation is None else override.enable_escalation,
-        warn_threshold=defaults.warn_threshold if override.warn_threshold is None else override.warn_threshold,
-        timeout_threshold=defaults.timeout_threshold if override.timeout_threshold is None else override.timeout_threshold,
-        kick_threshold=defaults.kick_threshold if override.kick_threshold is None else override.kick_threshold,
-        ban_threshold=defaults.ban_threshold if override.ban_threshold is None else override.ban_threshold,
-        timeout_minutes=defaults.timeout_minutes if override.timeout_minutes is None else override.timeout_minutes,
-    )
+    settings = apply_moderation_override(defaults, source_config.moderation.guild_overrides.get(guild_id))
+    if config is None:
+        settings = apply_moderation_override(settings, GUILD_MODERATION_OVERRIDES.get(guild_id))
+    return settings
 
 
 def validate_config(config: Config) -> None:
@@ -546,6 +558,7 @@ if not BOT_TOKEN and not CLI_REGRESSION_MODE:
         "Missing SPAMFIGHTER_BOT_TOKEN. Set the environment variable or mount a secret file via SPAMFIGHTER_BOT_TOKEN_FILE."
     )
 SPAM_RULES_DATABASE_URL = env_secret_str("SPAMFIGHTER_SPAM_RULES_DATABASE_URL")
+RUNTIME_CONFIG_DATABASE_URL = env_secret_str("SPAMFIGHTER_DATABASE_URL") or SPAM_RULES_DATABASE_URL
 
 
 def apply_config(config: Config) -> None:
@@ -618,6 +631,42 @@ AI_REVIEW_DAILY_OUTPUT_TOKEN_LIMIT = int(env_str("SPAMFIGHTER_AI_DAILY_OUTPUT_TO
 AI_REVIEW_MONTHLY_OUTPUT_TOKEN_LIMIT = int(env_str("SPAMFIGHTER_AI_MONTHLY_OUTPUT_TOKEN_LIMIT", "22500000") or "22500000")
 KNOWN_IMAGE_HASH_MAX_BYTES = int(env_str("SPAMFIGHTER_IMAGE_HASH_MAX_BYTES", str(8 * 1024 * 1024)) or str(8 * 1024 * 1024))
 KNOWN_IMAGE_HASH_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+# 16x16 pHash = 256 bits, so each Hamming bit is ~0.39% of similarity. This keeps
+# thresholds like 98/99/99.5% meaningfully distinct (max distances 5/2/1).
+PHASH_HASH_SIZE = 16
+PHASH_BITS = PHASH_HASH_SIZE * PHASH_HASH_SIZE
+PHASH_HEX_LENGTH = PHASH_BITS // 4
+IMAGE_SIMILARITY_PERCENT_DEFAULT = 99.0
+IMAGE_SIMILARITY_PERCENT_MIN = 90.0
+IMAGE_SIMILARITY_PERCENT_MAX = 100.0
+IMAGE_SIMILARITY_PERCENT: float = IMAGE_SIMILARITY_PERCENT_DEFAULT
+IMAGE_SIMILARITY_SETTING_KEY = "image_similarity_percent"
+
+
+# Defined before apply_spam_rules(), which runs at import time and parses stored phashes.
+def parse_phash_hex(value: object) -> Optional[int]:
+    cleaned = str(value or "").strip().lower()
+    if cleaned.startswith("phash:"):
+        cleaned = cleaned.split(":", 1)[1].strip()
+    if len(cleaned) != PHASH_HEX_LENGTH:
+        return None
+    try:
+        return int(cleaned, 16)
+    except ValueError:
+        return None
+
+
+def phash_hamming_distance(left: int, right: int) -> int:
+    return (left ^ right).bit_count()
+
+
+def image_similarity_max_distance(percent: float) -> int:
+    clamped = min(max(float(percent), 0.0), 100.0)
+    return max(0, int((100.0 - clamped) * PHASH_BITS / 100.0 + 1e-9))
+
+
+def phash_similarity_percent(distance: int) -> float:
+    return round(100.0 * (1.0 - (distance / PHASH_BITS)), 2)
 LIVE_IMAGE_HASH_MODE = (env_str("SPAMFIGHTER_LIVE_IMAGE_HASH_MODE", "suspicious") or "suspicious").strip().lower()
 LIVE_IMAGE_HASH_SUSPICIOUS_TEXT_MAX_CHARS = int(
     env_str("SPAMFIGHTER_LIVE_IMAGE_HASH_SUSPICIOUS_TEXT_MAX_CHARS", "48") or "48"
@@ -753,6 +802,7 @@ OPENAI_RULE_RESPONSE_SCHEMA = {
                 "items": {"type": "string"},
             },
             "custom_rule_id": {"type": "string"},
+            "replacement_for": {"type": "string"},
             "description": {"type": "string"},
             "rationale": {"type": "string"},
             "confidence": {"type": "string", "enum": ["", "low", "medium", "high"]},
@@ -779,6 +829,7 @@ OPENAI_RULE_RESPONSE_SCHEMA = {
             "pattern",
             "exact_values",
             "custom_rule_id",
+            "replacement_for",
             "description",
             "rationale",
             "confidence",
@@ -824,6 +875,7 @@ class SpamRulesConfig:
     image_hashes: Tuple[str, ...]
     hooks: Dict[str, Tuple[str, ...]]
     custom_rules: Tuple[ManagedCustomRule, ...]
+    image_phashes: Tuple[str, ...] = tuple()
 
 
 def default_spam_rules_raw() -> dict:
@@ -837,6 +889,7 @@ def default_spam_rules_raw() -> dict:
         },
         "image_hashes": {
             "sha256": [],
+            "phash": [],
         },
         "hooks": {name: [] for name in MANAGED_RULE_HOOK_NAMES},
     }
@@ -880,6 +933,11 @@ def parse_spam_rules_from_raw(raw: dict) -> SpamRulesConfig:
         image_hashes=tuple(
             str(value).split(":", 1)[1].strip().lower() if str(value).lower().startswith("sha256:") else str(value).strip().lower()
             for value in image_hashes_raw.get("sha256", [])
+            if str(value).strip()
+        ),
+        image_phashes=tuple(
+            str(value).split(":", 1)[1].strip().lower() if str(value).lower().startswith("phash:") else str(value).strip().lower()
+            for value in image_hashes_raw.get("phash", [])
             if str(value).strip()
         ),
         hooks=hooks,
@@ -967,6 +1025,63 @@ async def save_spam_rules_raw_to_postgres(raw: dict) -> None:
     await asyncio.to_thread(_save_spam_rules_raw_to_postgres_sync, raw)
 
 
+def _require_runtime_config_postgres() -> str:
+    if not RUNTIME_CONFIG_DATABASE_URL:
+        raise RuntimeError("Postgres runtime config backend is not configured. Set SPAMFIGHTER_DATABASE_URL.")
+    if psycopg is None:
+        raise RuntimeError("psycopg is not installed. Install psycopg to use SPAMFIGHTER_DATABASE_URL.")
+    return RUNTIME_CONFIG_DATABASE_URL
+
+
+def _ensure_runtime_config_tables_sync(cur: object) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spamfighter_guild_log_channel_overrides (
+            guild_id BIGINT PRIMARY KEY,
+            audit_channel_id BIGINT,
+            enforcement_channel_id BIGINT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spamfighter_guild_moderation_overrides (
+            guild_id BIGINT PRIMARY KEY,
+            enable_deletion BOOLEAN,
+            enable_escalation BOOLEAN,
+            warn_threshold INTEGER,
+            timeout_threshold INTEGER,
+            kick_threshold INTEGER,
+            ban_threshold INTEGER,
+            timeout_minutes INTEGER,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+
+def _moderation_override_from_values(
+    *,
+    enable_deletion: object,
+    enable_escalation: object,
+    warn_threshold: object,
+    timeout_threshold: object,
+    kick_threshold: object,
+    ban_threshold: object,
+    timeout_minutes: object,
+) -> ModerationOverride:
+    return ModerationOverride(
+        enable_deletion=None if enable_deletion is None else bool(enable_deletion),
+        enable_escalation=None if enable_escalation is None else bool(enable_escalation),
+        warn_threshold=None if warn_threshold is None else int(warn_threshold),
+        timeout_threshold=None if timeout_threshold is None else int(timeout_threshold),
+        kick_threshold=None if kick_threshold is None else int(kick_threshold),
+        ban_threshold=None if ban_threshold is None else int(ban_threshold),
+        timeout_minutes=None if timeout_minutes is None else int(timeout_minutes),
+    )
+
+
 def ensure_spam_rules_file(path: Path = SPAM_RULES_PATH) -> None:
     if path.exists():
         return
@@ -981,6 +1096,7 @@ def ensure_spam_rules_file(path: Path = SPAM_RULES_PATH) -> None:
         "",
         "[image_hashes]",
         "sha256 = []",
+        "phash = []",
         "",
         "[hooks]",
     ]
@@ -1009,6 +1125,7 @@ def normalize_spam_rules_raw(raw: dict) -> dict:
 
     image_hashes = raw.setdefault("image_hashes", {})
     image_hashes.setdefault("sha256", [])
+    image_hashes.setdefault("phash", [])
 
     hooks = raw.setdefault("hooks", {})
     for hook_name in MANAGED_RULE_HOOK_NAMES:
@@ -1097,6 +1214,10 @@ def validate_spam_rules(config: SpamRulesConfig) -> None:
         if not re.fullmatch(r"[a-f0-9]{64}", hash_value):
             raise ValueError(f"spam_rules.image_hashes contains an invalid sha256 value: {hash_value!r}")
 
+    for hash_value in config.image_phashes:
+        if not re.fullmatch(r"[a-f0-9]{64}", hash_value):
+            raise ValueError(f"spam_rules.image_hashes contains an invalid phash value: {hash_value!r}")
+
     for hook_name, patterns in config.hooks.items():
         if hook_name not in MANAGED_RULE_HOOK_NAMES:
             raise ValueError(f"spam_rules.hooks.{hook_name} is not a supported managed hook")
@@ -1117,6 +1238,7 @@ SPAM_RULES_LOCK = asyncio.Lock()
 SPAM_RULES = SpamRulesConfig(schema_version=1, artifact_values=tuple(), image_hashes=tuple(), hooks={name: tuple() for name in MANAGED_RULE_HOOK_NAMES}, custom_rules=tuple())
 MANAGED_KNOWN_SPAM_ARTIFACTS: Tuple[str, ...] = tuple()
 MANAGED_KNOWN_IMAGE_HASHES: Set[str] = set()
+MANAGED_KNOWN_IMAGE_PHASHES: Tuple[int, ...] = tuple()
 MANAGED_HOOK_PATTERNS: Dict[str, Tuple[safe_regex.Pattern[str], ...]] = {name: tuple() for name in MANAGED_RULE_HOOK_NAMES}
 MANAGED_CUSTOM_RULES: Tuple[ManagedCustomRule, ...] = tuple()
 MANAGED_CUSTOM_RULE_PATTERNS: Dict[str, safe_regex.Pattern[str]] = {}
@@ -1125,10 +1247,14 @@ MANAGED_CUSTOM_RULE_PATTERNS: Dict[str, safe_regex.Pattern[str]] = {}
 def apply_spam_rules(config: SpamRulesConfig) -> None:
     global SPAM_RULES, MANAGED_KNOWN_SPAM_ARTIFACTS, MANAGED_HOOK_PATTERNS
     global MANAGED_CUSTOM_RULES, MANAGED_CUSTOM_RULE_PATTERNS, MANAGED_KNOWN_IMAGE_HASHES
+    global MANAGED_KNOWN_IMAGE_PHASHES
 
     SPAM_RULES = config
     MANAGED_KNOWN_SPAM_ARTIFACTS = tuple(normalize_for_scan(value) for value in config.artifact_values if value)
     MANAGED_KNOWN_IMAGE_HASHES = {value.lower() for value in config.image_hashes}
+    MANAGED_KNOWN_IMAGE_PHASHES = tuple(
+        parsed for parsed in (parse_phash_hex(value) for value in config.image_phashes) if parsed is not None
+    )
     MANAGED_HOOK_PATTERNS = {
         hook_name: tuple(
             compile_dynamic_regex(pattern, where=f"spam_rules.hooks.{hook_name}")
@@ -1641,6 +1767,7 @@ class RuleSuggestion:
     pattern: str = ""
     exact_values: List[str] = field(default_factory=list)
     custom_rule_id: str = ""
+    replacement_for: str = ""
     description: str = ""
     rationale: str = ""
     confidence: str = ""
@@ -1667,6 +1794,7 @@ class RuleReportState:
     normalized_content: str = ""
     media_indicators: str = ""
     image_hashes: List[str] = field(default_factory=list)
+    image_phashes: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_reported_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     reporter_ids: Set[int] = field(default_factory=set)
@@ -1730,6 +1858,7 @@ class PreparedRuleReportCandidate:
     media_indicators: str
     image_hashes: List[str]
     cluster_key: str
+    image_phashes: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -1760,6 +1889,7 @@ class CompiledSuggestionMatchers:
     custom_rule_pattern: Optional[safe_regex.Pattern[str]] = None
     artifact_values: Set[str] = field(default_factory=set)
     hash_values: Set[str] = field(default_factory=set)
+    phash_values: Set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -1781,13 +1911,16 @@ RULE_REPORTS_LOCK = asyncio.Lock()
 AI_USAGE = AIUsageState()
 AI_USAGE_LOCK = asyncio.Lock()
 AUDIT_DETAIL_PAYLOADS: Dict[int, AuditDeletionDetailPayload] = {}
-ATTACHMENT_HASH_CACHE: "OrderedDict[int, Tuple[str, datetime]]" = OrderedDict()
+ATTACHMENT_HASH_CACHE: "OrderedDict[int, Tuple[Optional[str], Optional[str], datetime]]" = OrderedDict()
 STATE_DB_LOCK = asyncio.Lock()
 SPAM_RULES_DEPLOY_LOCK = asyncio.Lock()
 STATE_DB_CONNECTION: Optional[aiosqlite.Connection] = None
 APP_STATE_LOCK = asyncio.Lock()
 DISABLED_GUILD_COMMANDS: Dict[int, Set[str]] = defaultdict(set)
 CONFIG_DISABLED_COMMANDS_BY_GUILD: Dict[int, Set[str]] = {}
+GUILD_MODERATION_OVERRIDES: Dict[int, ModerationOverride] = {}
+GUILD_AUDIT_CHANNEL_OVERRIDES: Dict[int, int] = {}
+GUILD_ENFORCEMENT_CHANNEL_OVERRIDES: Dict[int, int] = {}
 HEALTHCHECK_SERVER: Optional[asyncio.AbstractServer] = None
 WATCHDOG_TASK: Optional[asyncio.Task] = None
 INSTANCE_ROLE_TASK: Optional[asyncio.Task] = None
@@ -2303,6 +2436,169 @@ async def set_disabled_guild_command(guild_id: int, command_name: str, *, disabl
             DISABLED_GUILD_COMMANDS.pop(guild_id, None)
 
 
+def _load_guild_moderation_overrides_from_postgres_sync() -> Dict[int, ModerationOverride]:
+    database_url = _require_runtime_config_postgres()
+    loaded: Dict[int, ModerationOverride] = {}
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            _ensure_runtime_config_tables_sync(cur)
+            cur.execute(
+                """
+                SELECT
+                    guild_id,
+                    enable_deletion,
+                    enable_escalation,
+                    warn_threshold,
+                    timeout_threshold,
+                    kick_threshold,
+                    ban_threshold,
+                    timeout_minutes
+                FROM spamfighter_guild_moderation_overrides
+                """
+            )
+            rows = cur.fetchall()
+        conn.commit()
+
+    for row in rows:
+        guild_id = int(row[0] or 0)
+        if guild_id <= 0:
+            continue
+        override = _moderation_override_from_values(
+            enable_deletion=row[1],
+            enable_escalation=row[2],
+            warn_threshold=row[3],
+            timeout_threshold=row[4],
+            kick_threshold=row[5],
+            ban_threshold=row[6],
+            timeout_minutes=row[7],
+        )
+        loaded[guild_id] = override
+    return loaded
+
+
+async def load_guild_moderation_overrides() -> None:
+    GUILD_MODERATION_OVERRIDES.clear()
+    loaded = await asyncio.to_thread(_load_guild_moderation_overrides_from_postgres_sync)
+    for guild_id, override in loaded.items():
+        try:
+            validate_thresholds(
+                apply_moderation_override(resolve_moderation_settings(guild_id, config=CONFIG), override),
+                where=f"guild_moderation_overrides.{guild_id}",
+            )
+        except ValueError as exc:
+            log.warning("Ignoring invalid stored guild moderation override for guild %s: %s", guild_id, exc)
+            continue
+        GUILD_MODERATION_OVERRIDES[guild_id] = override
+
+
+def _load_guild_log_channel_overrides_from_postgres_sync() -> Tuple[Dict[int, int], Dict[int, int]]:
+    database_url = _require_runtime_config_postgres()
+    audit_overrides: Dict[int, int] = {}
+    enforcement_overrides: Dict[int, int] = {}
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            _ensure_runtime_config_tables_sync(cur)
+            cur.execute(
+                "SELECT guild_id, audit_channel_id, enforcement_channel_id FROM spamfighter_guild_log_channel_overrides"
+            )
+            rows = cur.fetchall()
+        conn.commit()
+
+    for row in rows:
+        guild_id = int(row[0] or 0)
+        if guild_id <= 0:
+            continue
+        if row[1] is not None:
+            audit_overrides[guild_id] = int(row[1])
+        if row[2] is not None:
+            enforcement_overrides[guild_id] = int(row[2])
+    return audit_overrides, enforcement_overrides
+
+
+async def load_guild_log_channel_overrides() -> None:
+    GUILD_AUDIT_CHANNEL_OVERRIDES.clear()
+    GUILD_ENFORCEMENT_CHANNEL_OVERRIDES.clear()
+    audit_overrides, enforcement_overrides = await asyncio.to_thread(_load_guild_log_channel_overrides_from_postgres_sync)
+    GUILD_AUDIT_CHANNEL_OVERRIDES.update(audit_overrides)
+    GUILD_ENFORCEMENT_CHANNEL_OVERRIDES.update(enforcement_overrides)
+
+
+def _ensure_global_settings_table_sync(cur: object) -> None:
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spamfighter_global_settings (
+            key TEXT PRIMARY KEY,
+            value JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+
+def _load_global_setting_sync(key: str) -> Optional[object]:
+    database_url = _require_runtime_config_postgres()
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            _ensure_global_settings_table_sync(cur)
+            cur.execute("SELECT value FROM spamfighter_global_settings WHERE key = %s", (key,))
+            row = cur.fetchone()
+        conn.commit()
+    if row is None:
+        return None
+    value = row[0]
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        value = bytes(value).decode("utf-8")
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def _save_global_setting_sync(key: str, value: object) -> None:
+    database_url = _require_runtime_config_postgres()
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            _ensure_global_settings_table_sync(cur)
+            cur.execute(
+                """
+                INSERT INTO spamfighter_global_settings (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE
+                SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                (key, json.dumps(value)),
+            )
+        conn.commit()
+
+
+def clamp_image_similarity_percent(percent: float) -> float:
+    return min(IMAGE_SIMILARITY_PERCENT_MAX, max(IMAGE_SIMILARITY_PERCENT_MIN, float(percent)))
+
+
+async def load_global_settings() -> None:
+    global IMAGE_SIMILARITY_PERCENT
+    try:
+        stored = await asyncio.to_thread(_load_global_setting_sync, IMAGE_SIMILARITY_SETTING_KEY)
+    except Exception as exc:
+        log.warning("Could not load global settings from Postgres; keeping defaults: %s", exc)
+        return
+    if stored is None:
+        return
+    try:
+        IMAGE_SIMILARITY_PERCENT = clamp_image_similarity_percent(float(stored))
+    except (TypeError, ValueError):
+        log.warning("Ignoring invalid stored %s value: %r", IMAGE_SIMILARITY_SETTING_KEY, stored)
+
+
+async def set_image_similarity_percent(percent: float) -> None:
+    global IMAGE_SIMILARITY_PERCENT
+    clamped = clamp_image_similarity_percent(percent)
+    await asyncio.to_thread(_save_global_setting_sync, IMAGE_SIMILARITY_SETTING_KEY, clamped)
+    IMAGE_SIMILARITY_PERCENT = clamped
+
+
 async def migrate_legacy_rule_report_state(path: Path = RULE_REPORTS_PATH) -> None:
     connection = await get_state_db_connection()
     row = await (await connection.execute("SELECT COUNT(*) AS count FROM rule_reports")).fetchone()
@@ -2373,6 +2669,9 @@ async def initialize_state_storage() -> None:
     await load_runtime_state()
     await load_retro_scan_state(mark_running_as_interrupted=True)
     await load_disabled_guild_commands()
+    await load_guild_moderation_overrides()
+    await load_guild_log_channel_overrides()
+    await load_global_settings()
     await load_guild_domain_blocklist_settings()
     await refresh_domain_blocklists(force=True)
     await persist_runtime_state()
@@ -2828,6 +3127,23 @@ def guild_admin_or_super_user_only():
     return app_commands.check(predicate)
 
 
+def guild_administrator_or_control_operator_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise GuildOnlyCommand("This command must be used in a guild.")
+        if interaction.user.id in CONTROL_SUPER_USER_IDS or interaction.user.id in CONTROL_ADMIN_USER_IDS:
+            return True
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if bool(getattr(permissions, "administrator", False)):
+            return True
+
+        raise GuildAdminOrSuperUserOnly(
+            "You must have Administrator in this guild, or be a configured control admin/super-user."
+        )
+
+    return app_commands.check(predicate)
+
+
 def normalize_command_name(command_name: str) -> str:
     normalized = command_name.strip().lower().lstrip("/")
     normalized = re.sub(r"\s+", " ", normalized)
@@ -2945,7 +3261,10 @@ class SpamGuardBot(commands.Bot):
         if refreshed_reporters:
             await persist_rule_reports_state()
         await self.add_cog(ReportCog(self))
-        await self.add_cog(AdminCog(self))
+        admin_cog = AdminCog(self)
+        await self.add_cog(admin_cog)
+        for command_group in admin_cog.extra_app_command_groups:
+            self.tree.add_command(command_group)
         self.add_view(AuditDeletionDetailView())
         for report in RULE_REPORTS.values():
             if report.review_message_id is not None and report.status not in {"approved", "denied"}:
@@ -3199,6 +3518,17 @@ LEGIT_ACCESSIBILITY_SCRIBE_REQUEST = re.compile(r"a\A")
 LEGIT_EXACT_TUTORING_LINK = re.compile(r"a\A")
 LEGIT_EVENT_PROMOTION = re.compile(r"a\A")
 LEGIT_OFFICER_ELECTION_TEMPLATE = re.compile(r"a\A")
+LEGIT_ELECTION_TICKET_DISCUSSION = re.compile(
+    r"\b(?:"
+    r"ticket[\W_]*system|"
+    r"president[\W_]*(?:and|&)[\W_]*(?:vice[\W_]*president|vp)|"
+    r"vice[\W_]*president|"
+    r"vp|"
+    r"vote[\W_]*for[\W_]*(?:a[\W_]*)?pair|"
+    r"traditional[\W_]*pick[\W_]*a[\W_]*president"
+    r")\b",
+    re.IGNORECASE,
+)
 LEGIT_JOB_REFERRAL_POST = re.compile(r"a\A")
 LEGIT_INTERNAL_CLUB_UPDATE = re.compile(r"a\A")
 
@@ -3274,6 +3604,11 @@ def is_likely_legit_campus_post(normalized: str) -> bool:
     if LEGIT_EXACT_TUTORING_LINK.search(normalized):
         return True
     if LEGIT_OFFICER_ELECTION_TEMPLATE.search(normalized):
+        return True
+    if (
+        LEGIT_ELECTION_TICKET_DISCUSSION.search(normalized)
+        and re.search(r"\b(?:vote|election|president|vice[\W_]*president|vp|ticket[\W_]*system)\b", normalized, re.IGNORECASE)
+    ):
         return True
     if (
         LEGIT_EVENT_PROMOTION.search(normalized)
@@ -3515,6 +3850,7 @@ def serialize_rule_suggestion(suggestion: Optional[RuleSuggestion]) -> Optional[
         "pattern": suggestion.pattern,
         "exact_values": list(suggestion.exact_values),
         "custom_rule_id": suggestion.custom_rule_id,
+        "replacement_for": suggestion.replacement_for,
         "description": suggestion.description,
         "rationale": suggestion.rationale,
         "confidence": suggestion.confidence,
@@ -3536,6 +3872,7 @@ def deserialize_rule_suggestion(payload: Optional[dict]) -> Optional[RuleSuggest
         pattern=str(payload.get("pattern", "")).strip(),
         exact_values=[str(value).strip() for value in payload.get("exact_values", []) if str(value).strip()],
         custom_rule_id=str(payload.get("custom_rule_id", "")).strip(),
+        replacement_for=str(payload.get("replacement_for", "")).strip(),
         description=str(payload.get("description", "")).strip(),
         rationale=str(payload.get("rationale", "")).strip(),
         confidence=str(payload.get("confidence", "")).strip(),
@@ -3563,6 +3900,7 @@ def serialize_rule_report(report: RuleReportState) -> dict:
         "normalized_content": report.normalized_content,
         "media_indicators": report.media_indicators,
         "image_hashes": list(report.image_hashes),
+        "image_phashes": list(report.image_phashes),
         "created_at": report.created_at.isoformat(),
         "last_reported_at": report.last_reported_at.isoformat(),
         "reporter_ids": sorted(report.reporter_ids),
@@ -3619,6 +3957,7 @@ def deserialize_rule_report(payload: dict) -> RuleReportState:
         normalized_content=str(payload.get("normalized_content", "")).strip(),
         media_indicators=str(payload.get("media_indicators", "")).strip(),
         image_hashes=[str(value).strip() for value in payload.get("image_hashes", []) if str(value).strip()],
+        image_phashes=[str(value).strip() for value in payload.get("image_phashes", []) if str(value).strip()],
         created_at=created_at,
         last_reported_at=last_reported_at,
         reporter_ids={int(value) for value in payload.get("reporter_ids", [])},
@@ -3809,7 +4148,7 @@ def build_report_cluster_key(normalized_content: str, media_indicators: str, ima
 def prune_attachment_hash_cache(*, now: Optional[datetime] = None) -> None:
     current_time = now or utcnow()
     while ATTACHMENT_HASH_CACHE:
-        attachment_id, (_, cached_at) = next(iter(ATTACHMENT_HASH_CACHE.items()))
+        attachment_id, (_, _, cached_at) = next(iter(ATTACHMENT_HASH_CACHE.items()))
         if (current_time - cached_at).total_seconds() <= ATTACHMENT_HASH_CACHE_TTL_SECONDS:
             break
         ATTACHMENT_HASH_CACHE.pop(attachment_id, None)
@@ -3818,7 +4157,7 @@ def prune_attachment_hash_cache(*, now: Optional[datetime] = None) -> None:
         ATTACHMENT_HASH_CACHE.popitem(last=False)
 
 
-def attachment_hash_cache_get(attachment_id: int) -> Optional[str]:
+def attachment_hash_cache_get(attachment_id: int) -> Optional[Tuple[Optional[str], Optional[str]]]:
     if attachment_id <= 0:
         return None
 
@@ -3827,20 +4166,20 @@ def attachment_hash_cache_get(attachment_id: int) -> Optional[str]:
     if cached is None:
         return None
 
-    digest, cached_at = cached
+    digest, phash_hex, cached_at = cached
     if (utcnow() - cached_at).total_seconds() > ATTACHMENT_HASH_CACHE_TTL_SECONDS:
         ATTACHMENT_HASH_CACHE.pop(attachment_id, None)
         return None
 
     ATTACHMENT_HASH_CACHE.move_to_end(attachment_id)
-    return digest
+    return digest, phash_hex
 
 
-def attachment_hash_cache_put(attachment_id: int, digest: str) -> None:
+def attachment_hash_cache_put(attachment_id: int, digest: Optional[str], phash_hex: Optional[str]) -> None:
     if attachment_id <= 0 or not digest:
         return
 
-    ATTACHMENT_HASH_CACHE[attachment_id] = (digest, utcnow())
+    ATTACHMENT_HASH_CACHE[attachment_id] = (digest, phash_hex, utcnow())
     ATTACHMENT_HASH_CACHE.move_to_end(attachment_id)
     prune_attachment_hash_cache()
 
@@ -3892,46 +4231,103 @@ def _sha256_hexdigest(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-async def compute_attachment_sha256(attachment: discord.Attachment) -> Optional[str]:
+def is_phash_supported() -> bool:
+    return imagehash is not None and Image is not None
+
+
+def _phash_hexdigest(payload: bytes) -> Optional[str]:
+    if not is_phash_supported():
+        return None
+    try:
+        with Image.open(io.BytesIO(payload)) as img:
+            digest = str(imagehash.phash(img, hash_size=PHASH_HASH_SIZE)).strip().lower()
+    except Exception:
+        return None
+    if len(digest) != PHASH_HEX_LENGTH or parse_phash_hex(digest) is None:
+        return None
+    return digest
+
+
+def _attachment_hash_pair(payload: bytes) -> Tuple[str, Optional[str]]:
+    return _sha256_hexdigest(payload), _phash_hexdigest(payload)
+
+
+async def compute_attachment_hashes(attachment: discord.Attachment) -> Tuple[Optional[str], Optional[str]]:
     attachment_id = int(getattr(attachment, "id", 0) or 0)
-    cached_digest = attachment_hash_cache_get(attachment_id)
-    if cached_digest is not None:
-        return cached_digest
+    cached = attachment_hash_cache_get(attachment_id)
+    if cached is not None:
+        return cached
 
     size = int(getattr(attachment, "size", 0) or 0)
     if size <= 0 or size > KNOWN_IMAGE_HASH_MAX_BYTES:
-        return None
+        return None, None
     if not is_hashable_image_attachment(attachment):
-        return None
+        return None, None
 
     try:
         payload = await read_attachment_bytes(attachment)
     except (discord.Forbidden, discord.NotFound, discord.HTTPException):
-        return None
+        return None, None
 
-    digest = await asyncio.to_thread(_sha256_hexdigest, payload)
+    digest, phash_hex = await asyncio.to_thread(_attachment_hash_pair, payload)
     if attachment_id:
-        attachment_hash_cache_put(attachment_id, digest)
-    return digest
+        attachment_hash_cache_put(attachment_id, digest, phash_hex)
+    return digest, phash_hex
+
+
+async def compute_message_image_hash_pairs(message: discord.Message) -> Tuple[List[str], List[str]]:
+    hashes: List[str] = []
+    phashes: List[str] = []
+    for attachment in message.attachments:
+        digest, phash_hex = await compute_attachment_hashes(attachment)
+        if digest and digest not in hashes:
+            hashes.append(digest)
+        if phash_hex and phash_hex not in phashes:
+            phashes.append(phash_hex)
+    return hashes, phashes
 
 
 async def compute_message_image_hashes(message: discord.Message) -> List[str]:
-    hashes: List[str] = []
-    for attachment in message.attachments:
-        digest = await compute_attachment_sha256(attachment)
-        if digest and digest not in hashes:
-            hashes.append(digest)
+    hashes, _ = await compute_message_image_hash_pairs(message)
     return hashes
 
 
+def match_known_spam_phash(
+    phash_hex: str,
+    *,
+    known_phashes: Optional[Sequence[int]] = None,
+    percent: Optional[float] = None,
+) -> Optional[Tuple[int, float]]:
+    parsed = parse_phash_hex(phash_hex)
+    if parsed is None:
+        return None
+    candidates = MANAGED_KNOWN_IMAGE_PHASHES if known_phashes is None else known_phashes
+    if not candidates:
+        return None
+    threshold_percent = IMAGE_SIMILARITY_PERCENT if percent is None else percent
+    max_distance = image_similarity_max_distance(threshold_percent)
+    best: Optional[Tuple[int, float]] = None
+    for known in candidates:
+        distance = phash_hamming_distance(parsed, known)
+        if distance <= max_distance and (best is None or distance < best[0]):
+            best = (distance, phash_similarity_percent(distance))
+    return best
+
+
 async def classify_known_spam_image_hashes(message: discord.Message) -> Tuple[bool, str, str, List[str]]:
-    if not MANAGED_KNOWN_IMAGE_HASHES:
+    if not MANAGED_KNOWN_IMAGE_HASHES and not MANAGED_KNOWN_IMAGE_PHASHES:
         return False, "", "", []
 
-    hashes = await compute_message_image_hashes(message)
+    hashes, phashes = await compute_message_image_hash_pairs(message)
     hits = [digest for digest in hashes if digest in MANAGED_KNOWN_IMAGE_HASHES]
     if hits:
         return True, "known_spam_artifact", "sha256:" + ", ".join(hits), hashes
+
+    for phash_hex in phashes:
+        matched = match_known_spam_phash(phash_hex)
+        if matched is not None:
+            _, similarity = matched
+            return True, "known_spam_artifact", f"phash:{phash_hex} ({similarity}% similar)", hashes
     return False, "", "", hashes
 
 
@@ -3999,11 +4395,12 @@ def suggestion_custom_rule_match(
     return safe_dynamic_regex_search(compiled, normalized)
 
 
-def suggestion_artifact_values(suggestion: Optional[RuleSuggestion]) -> Tuple[Set[str], Set[str]]:
+def suggestion_artifact_values(suggestion: Optional[RuleSuggestion]) -> Tuple[Set[str], Set[str], Set[str]]:
     normalized_values: Set[str] = set()
     hash_values: Set[str] = set()
+    phash_values: Set[str] = set()
     if suggestion is None or suggestion.decision != "propose" or suggestion.target_type != "artifact":
-        return normalized_values, hash_values
+        return normalized_values, hash_values, phash_values
 
     for value in suggestion.exact_values:
         cleaned = str(value).strip()
@@ -4012,15 +4409,18 @@ def suggestion_artifact_values(suggestion: Optional[RuleSuggestion]) -> Tuple[Se
         if cleaned.lower().startswith("sha256:"):
             hash_values.add(cleaned.split(":", 1)[1].strip().lower())
             continue
+        if cleaned.lower().startswith("phash:"):
+            phash_values.add(cleaned.split(":", 1)[1].strip().lower())
+            continue
         normalized_values.add(normalize_for_scan(cleaned))
-    return normalized_values, hash_values
+    return normalized_values, hash_values, phash_values
 
 
 def compile_suggestion_matchers(suggestion: Optional[RuleSuggestion]) -> CompiledSuggestionMatchers:
     if suggestion is None or suggestion.decision != "propose":
         return CompiledSuggestionMatchers()
 
-    artifact_values, hash_values = suggestion_artifact_values(suggestion)
+    artifact_values, hash_values, phash_values = suggestion_artifact_values(suggestion)
     hook_patterns: Dict[str, safe_regex.Pattern[str]] = {}
     custom_rule_pattern: Optional[safe_regex.Pattern[str]] = None
 
@@ -4047,6 +4447,7 @@ def compile_suggestion_matchers(suggestion: Optional[RuleSuggestion]) -> Compile
         custom_rule_pattern=custom_rule_pattern,
         artifact_values=artifact_values,
         hash_values=hash_values,
+        phash_values=phash_values,
     )
 
 
@@ -4071,13 +4472,23 @@ def classify_candidate_content_and_media(
     content: str,
     media_indicators: str = "",
     image_hashes: Optional[Sequence[str]] = None,
+    image_phashes: Optional[Sequence[str]] = None,
     suggestion: Optional[RuleSuggestion] = None,
     compiled_suggestion: Optional[CompiledSuggestionMatchers] = None,
 ) -> Tuple[bool, str, str]:
     normalized = normalize_for_scan(content or "")
     normalized_media = normalize_for_scan(media_indicators or "")
     image_hashes = [str(value).strip().lower() for value in (image_hashes or []) if str(value).strip()]
+    image_phashes = [str(value).strip().lower() for value in (image_phashes or []) if str(value).strip()]
     candidate_hashes = compiled_suggestion.hash_values if compiled_suggestion is not None else suggestion_artifact_values(suggestion)[1]
+    candidate_phashes = compiled_suggestion.phash_values if compiled_suggestion is not None else suggestion_artifact_values(suggestion)[2]
+    phash_candidates: Tuple[int, ...] = MANAGED_KNOWN_IMAGE_PHASHES + tuple(
+        parsed for parsed in (parse_phash_hex(value) for value in candidate_phashes) if parsed is not None
+    )
+    phash_hits = [
+        value for value in image_phashes
+        if match_known_spam_phash(value, known_phashes=phash_candidates) is not None
+    ]
     managed_hook_hits: Dict[str, bool] = {}
     suggestion_hook_hits: Dict[str, bool] = {}
 
@@ -4116,16 +4527,24 @@ def classify_candidate_content_and_media(
                 compiled_suggestion=compiled_suggestion,
             )
             or any(digest in MANAGED_KNOWN_IMAGE_HASHES or digest in candidate_hashes for digest in image_hashes)
+            or bool(phash_hits)
         )
         and not anti_ticket
         and not anti_giveaway
     ):
         artifact_normalized = normalized if normalized.strip() else normalized_media
+        hash_parts: List[str] = []
         if image_hashes and any(digest in MANAGED_KNOWN_IMAGE_HASHES or digest in candidate_hashes for digest in image_hashes):
-            artifact_normalized = "sha256:" + ", ".join(
-                digest for digest in image_hashes
-                if digest in MANAGED_KNOWN_IMAGE_HASHES or digest in candidate_hashes
+            hash_parts.append(
+                "sha256:" + ", ".join(
+                    digest for digest in image_hashes
+                    if digest in MANAGED_KNOWN_IMAGE_HASHES or digest in candidate_hashes
+                )
             )
+        if phash_hits:
+            hash_parts.append("phash:" + ", ".join(phash_hits))
+        if hash_parts:
+            artifact_normalized = "; ".join(hash_parts)
         return True, "known_spam_artifact", artifact_normalized
 
     if is_likely_legit_campus_post(normalized):
@@ -4408,7 +4827,9 @@ def resolve_audit_channel_ids(guild_id: Optional[int]) -> List[int]:
     ids: List[int] = []
     if DEFAULT_AUDIT_LOG_CHANNEL_ID:
         ids.append(DEFAULT_AUDIT_LOG_CHANNEL_ID)
-    if guild_id is not None and guild_id in AUDIT_LOG_CHANNEL_MAP:
+    if guild_id is not None and guild_id in GUILD_AUDIT_CHANNEL_OVERRIDES:
+        ids.append(GUILD_AUDIT_CHANNEL_OVERRIDES[guild_id])
+    elif guild_id is not None and guild_id in AUDIT_LOG_CHANNEL_MAP:
         ids.append(AUDIT_LOG_CHANNEL_MAP[guild_id])
 
     unique_ids: List[int] = []
@@ -4424,7 +4845,9 @@ def resolve_enforcement_channel_ids(guild_id: Optional[int]) -> List[int]:
     ids: List[int] = []
     if DEFAULT_ENFORCEMENT_LOG_CHANNEL_ID:
         ids.append(DEFAULT_ENFORCEMENT_LOG_CHANNEL_ID)
-    if guild_id is not None and guild_id in ENFORCEMENT_LOG_CHANNEL_MAP:
+    if guild_id is not None and guild_id in GUILD_ENFORCEMENT_CHANNEL_OVERRIDES:
+        ids.append(GUILD_ENFORCEMENT_CHANNEL_OVERRIDES[guild_id])
+    elif guild_id is not None and guild_id in ENFORCEMENT_LOG_CHANNEL_MAP:
         ids.append(ENFORCEMENT_LOG_CHANNEL_MAP[guild_id])
 
     unique_ids: List[int] = []
@@ -5039,6 +5462,11 @@ def build_permission_embed(
 
 def build_guild_settings_embed(guild: discord.Guild) -> discord.Embed:
     moderation = resolve_moderation_settings(guild.id)
+    audit_channel_id = GUILD_AUDIT_CHANNEL_OVERRIDES.get(guild.id, AUDIT_LOG_CHANNEL_MAP.get(guild.id))
+    enforcement_channel_id = GUILD_ENFORCEMENT_CHANNEL_OVERRIDES.get(
+        guild.id,
+        ENFORCEMENT_LOG_CHANNEL_MAP.get(guild.id),
+    )
 
     embed = base_embed(
         title="SpamFighter Guild Configuration",
@@ -5048,12 +5476,12 @@ def build_guild_settings_embed(guild: discord.Guild) -> discord.Embed:
     embed.add_field(name="Guild", value=f"{guild.name} (`{guild.id}`)", inline=False)
     embed.add_field(
         name="Audit Channel",
-        value=f"<#{AUDIT_LOG_CHANNEL_MAP[guild.id]}>" if guild.id in AUDIT_LOG_CHANNEL_MAP else "Not configured",
+        value=f"<#{audit_channel_id}>" if audit_channel_id else "Not configured",
         inline=True,
     )
     embed.add_field(
         name="Enforcement Channel",
-        value=f"<#{ENFORCEMENT_LOG_CHANNEL_MAP[guild.id]}>" if guild.id in ENFORCEMENT_LOG_CHANNEL_MAP else "Not configured",
+        value=f"<#{enforcement_channel_id}>" if enforcement_channel_id else "Not configured",
         inline=True,
     )
     embed.add_field(name="Main Audit Log", value=f"<#{DEFAULT_AUDIT_LOG_CHANNEL_ID}>" if DEFAULT_AUDIT_LOG_CHANNEL_ID else "Disabled", inline=True)
@@ -5076,18 +5504,91 @@ async def write_guild_channels(
     audit_channel_id: Optional[int] = None,
     enforcement_channel_id: Optional[int] = None,
 ) -> Config:
-    def mutator(raw: dict) -> None:
-        if audit_channel_id is not None:
-            audit_section = raw.setdefault("audit", {})
-            channel_map = audit_section.setdefault("channel_map", {})
-            channel_map[str(guild_id)] = audit_channel_id
+    current_audit_channel_id = GUILD_AUDIT_CHANNEL_OVERRIDES.get(guild_id, AUDIT_LOG_CHANNEL_MAP.get(guild_id))
+    current_enforcement_channel_id = GUILD_ENFORCEMENT_CHANNEL_OVERRIDES.get(
+        guild_id,
+        ENFORCEMENT_LOG_CHANNEL_MAP.get(guild_id),
+    )
+    updated_audit_channel_id = current_audit_channel_id if audit_channel_id is None else int(audit_channel_id)
+    updated_enforcement_channel_id = (
+        current_enforcement_channel_id if enforcement_channel_id is None else int(enforcement_channel_id)
+    )
 
-        if enforcement_channel_id is not None:
-            enforcement_section = raw.setdefault("enforcement", {})
-            channel_map = enforcement_section.setdefault("channel_map", {})
-            channel_map[str(guild_id)] = enforcement_channel_id
+    def write_sync() -> None:
+        database_url = _require_runtime_config_postgres()
+        with psycopg.connect(database_url) as conn:
+            with conn.cursor() as cur:
+                _ensure_runtime_config_tables_sync(cur)
+                cur.execute(
+                    """
+                    INSERT INTO spamfighter_guild_log_channel_overrides (
+                        guild_id,
+                        audit_channel_id,
+                        enforcement_channel_id,
+                        updated_at
+                    ) VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT(guild_id) DO UPDATE SET
+                        audit_channel_id = EXCLUDED.audit_channel_id,
+                        enforcement_channel_id = EXCLUDED.enforcement_channel_id,
+                        updated_at = NOW()
+                    """,
+                    (
+                        int(guild_id),
+                        updated_audit_channel_id,
+                        updated_enforcement_channel_id,
+                    ),
+                )
+            conn.commit()
 
-    return await mutate_config(mutator)
+    await asyncio.to_thread(write_sync)
+
+    if updated_audit_channel_id is not None:
+        GUILD_AUDIT_CHANNEL_OVERRIDES[guild_id] = updated_audit_channel_id
+    if updated_enforcement_channel_id is not None:
+        GUILD_ENFORCEMENT_CHANNEL_OVERRIDES[guild_id] = updated_enforcement_channel_id
+    return CONFIG
+
+
+def _save_guild_moderation_override_to_postgres_sync(guild_id: int, updated: ModerationOverride) -> None:
+    database_url = _require_runtime_config_postgres()
+    with psycopg.connect(database_url) as conn:
+        with conn.cursor() as cur:
+            _ensure_runtime_config_tables_sync(cur)
+            cur.execute(
+            """
+            INSERT INTO spamfighter_guild_moderation_overrides (
+                guild_id,
+                enable_deletion,
+                enable_escalation,
+                warn_threshold,
+                timeout_threshold,
+                kick_threshold,
+                ban_threshold,
+                timeout_minutes,
+                updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT(guild_id) DO UPDATE SET
+                enable_deletion = EXCLUDED.enable_deletion,
+                enable_escalation = EXCLUDED.enable_escalation,
+                warn_threshold = EXCLUDED.warn_threshold,
+                timeout_threshold = EXCLUDED.timeout_threshold,
+                kick_threshold = EXCLUDED.kick_threshold,
+                ban_threshold = EXCLUDED.ban_threshold,
+                timeout_minutes = EXCLUDED.timeout_minutes,
+                updated_at = NOW()
+            """,
+            (
+                int(guild_id),
+                updated.enable_deletion,
+                updated.enable_escalation,
+                updated.warn_threshold,
+                updated.timeout_threshold,
+                updated.kick_threshold,
+                updated.ban_threshold,
+                updated.timeout_minutes,
+            ),
+        )
+        conn.commit()
 
 
 async def write_guild_moderation_overrides(
@@ -5101,41 +5602,27 @@ async def write_guild_moderation_overrides(
     ban_threshold: Optional[int] = None,
     timeout_minutes: Optional[int] = None,
 ) -> Config:
-    def mutator(raw: dict) -> None:
-        moderation = raw.setdefault("moderation", {})
-        if "defaults" not in moderation and any(
-            key in moderation
-            for key in ("enable_deletion", "enable_escalation", "warn_threshold", "timeout_threshold", "kick_threshold", "ban_threshold", "timeout_minutes")
-        ):
-            moderation["defaults"] = {
-                "enable_deletion": moderation.pop("enable_deletion", True),
-                "enable_escalation": moderation.pop("enable_escalation", False),
-                "warn_threshold": moderation.pop("warn_threshold", 1),
-                "timeout_threshold": moderation.pop("timeout_threshold", 2),
-                "kick_threshold": moderation.pop("kick_threshold", 3),
-                "ban_threshold": moderation.pop("ban_threshold", 4),
-                "timeout_minutes": moderation.pop("timeout_minutes", 60),
-            }
+    current = GUILD_MODERATION_OVERRIDES.get(guild_id, ModerationOverride())
+    updated = replace(
+        current,
+        enable_deletion=current.enable_deletion if enable_deletion is None else bool(enable_deletion),
+        enable_escalation=current.enable_escalation if enable_escalation is None else bool(enable_escalation),
+        warn_threshold=current.warn_threshold if warn_threshold is None else int(warn_threshold),
+        timeout_threshold=current.timeout_threshold if timeout_threshold is None else int(timeout_threshold),
+        kick_threshold=current.kick_threshold if kick_threshold is None else int(kick_threshold),
+        ban_threshold=current.ban_threshold if ban_threshold is None else int(ban_threshold),
+        timeout_minutes=current.timeout_minutes if timeout_minutes is None else int(timeout_minutes),
+    )
 
-        overrides = moderation.setdefault("guild_overrides", {})
-        current = overrides.setdefault(str(guild_id), {})
+    validate_thresholds(
+        apply_moderation_override(resolve_moderation_settings(guild_id, config=CONFIG), updated),
+        where=f"guild_moderation_overrides.{guild_id}",
+    )
 
-        if enable_deletion is not None:
-            current["enable_deletion"] = bool(enable_deletion)
-        if enable_escalation is not None:
-            current["enable_escalation"] = bool(enable_escalation)
-        if warn_threshold is not None:
-            current["warn_threshold"] = int(warn_threshold)
-        if timeout_threshold is not None:
-            current["timeout_threshold"] = int(timeout_threshold)
-        if kick_threshold is not None:
-            current["kick_threshold"] = int(kick_threshold)
-        if ban_threshold is not None:
-            current["ban_threshold"] = int(ban_threshold)
-        if timeout_minutes is not None:
-            current["timeout_minutes"] = int(timeout_minutes)
+    await asyncio.to_thread(_save_guild_moderation_override_to_postgres_sync, guild_id, updated)
 
-    return await mutate_config(mutator)
+    GUILD_MODERATION_OVERRIDES[guild_id] = updated
+    return CONFIG
 
 
 async def set_global_guild_allowlist_enabled(enabled: bool) -> Config:
@@ -5908,6 +6395,11 @@ def build_rule_report_match_signals(report: RuleReportState) -> Dict[str, List[s
     for digest in report.image_hashes:
         if digest in MANAGED_KNOWN_IMAGE_HASHES:
             append_match_signal(signals, "known_spam_image_hash", f"sha256:{digest}")
+    for phash_hex in report.image_phashes:
+        phash_match = match_known_spam_phash(phash_hex)
+        if phash_match is not None:
+            _, similarity = phash_match
+            append_match_signal(signals, "known_spam_image_hash", f"phash:{phash_hex} ({similarity:.1f}% similar)")
 
     ticket_word = first_regex_hit(TICKET_WORDS, normalized)
     ticket_artist = first_regex_hit(ARTIST_EVENT_WORDS, normalized)
@@ -6213,7 +6705,7 @@ def build_ai_cost_estimate_lines(prompt_tokens: int, *, completion_tokens_cap: i
 
 def estimate_rule_review_prompt_tokens(report: RuleReportState) -> int:
     system_prompt = OPENAI_RULE_SYSTEM_PROMPT
-    user_prompt = build_openai_rule_prompt(report)
+    user_prompt = build_openai_false_positive_prompt(report) if is_false_positive_report(report) else build_openai_rule_prompt(report)
     return estimate_ai_input_tokens(system_prompt) + estimate_ai_input_tokens(user_prompt)
 
 
@@ -6364,6 +6856,128 @@ def build_openai_rule_prompt(report: RuleReportState) -> str:
     return json.dumps(payload, indent=2)
 
 
+def managed_hook_pattern_hits(hook_name: str, normalized: str) -> List[str]:
+    hits: List[str] = []
+    for pattern, compiled in zip(
+        SPAM_RULES.hooks.get(hook_name, tuple()),
+        MANAGED_HOOK_PATTERNS.get(hook_name, tuple()),
+    ):
+        if safe_dynamic_regex_search(compiled, normalized):
+            hits.append(pattern)
+    return hits
+
+
+def managed_custom_rule_hits(normalized: str) -> List[ManagedCustomRule]:
+    hits: List[ManagedCustomRule] = []
+    for rule in MANAGED_CUSTOM_RULES:
+        compiled = MANAGED_CUSTOM_RULE_PATTERNS.get(rule.rule_id)
+        if compiled is not None and safe_dynamic_regex_search(compiled, normalized):
+            hits.append(rule)
+    return hits
+
+
+def build_false_positive_edit_candidates(report: RuleReportState) -> List[Dict[str, str]]:
+    normalized = report.normalized_content or normalize_for_scan(report.message_content or "")
+    candidates: List[Dict[str, str]] = []
+
+    reason_hooks = {
+        "ticket_resale": ("ticket_words", "ticket_context", "ticket_contact"),
+        "giveaway_spam": ("giveaway_intent", "giveaway_item", "giveaway_contact"),
+        "job_spam": ("job_role", "job_remote", "job_pay", "job_tasks", "job_response"),
+        "academic_spam": ("academic_intent", "academic_contact"),
+    }
+    hook_names = reason_hooks.get(report.current_reason, MANAGED_RULE_HOOK_NAMES)
+    for hook_name in hook_names:
+        for pattern in managed_hook_pattern_hits(hook_name, normalized):
+            candidates.append(
+                {
+                    "target_type": "hook",
+                    "target_name": hook_name,
+                    "reason": report.current_reason,
+                    "pattern": pattern,
+                }
+            )
+
+    for rule in managed_custom_rule_hits(normalized):
+        candidates.append(
+            {
+                "target_type": "custom_rule",
+                "target_name": rule.rule_id,
+                "custom_rule_id": rule.rule_id,
+                "reason": rule.reason,
+                "pattern": rule.pattern,
+                "description": rule.description,
+            }
+        )
+
+    return candidates
+
+
+def build_openai_false_positive_prompt(report: RuleReportState) -> str:
+    content = trim_for_ai(redact_sensitive_for_ai(report.message_content), limit=max(500, AI_REVIEW_MAX_INPUT_CHARS // 3))
+    media = trim_for_ai(redact_sensitive_for_ai(report.media_indicators), limit=max(500, AI_REVIEW_MAX_INPUT_CHARS // 3))
+    normalized_content = trim_for_ai(
+        redact_sensitive_for_ai(report.normalized_content or normalize_for_scan(report.message_content or "")),
+        limit=max(500, AI_REVIEW_MAX_INPUT_CHARS // 3),
+    )
+    matched_signals = build_rule_report_match_signals(report)
+    candidates = build_false_positive_edit_candidates(report)
+
+    payload = {
+        "instruction": (
+            "This is a confirmed false positive. Propose the smallest safe replacement for one editable managed regex "
+            "so this legitimate sample no longer matches while obvious spam in the same family still matches. "
+            "If none of the editable candidates can be safely narrowed, return decision=ignore."
+        ),
+        "report": {
+            "kind": "false_positive",
+            "current_detector_match": report.current_matched,
+            "current_detector_reason": report.current_reason,
+            "message_content": content,
+            "normalized_content": normalized_content,
+            "media_indicators": media,
+            "matched_signals": matched_signals,
+            "staff_notes": trim_for_ai(redact_sensitive_for_ai(report.staff_notes), limit=1000),
+        },
+        "editable_candidates": candidates,
+        "output_contract": {
+            "decision": "Use 'propose' only when a safe replacement regex is available; otherwise use 'ignore'.",
+            "target_type": "One of: hook, custom_rule. Do not use artifact for false positives.",
+            "target_name": "For target_type=hook, the hook name from editable_candidates. For custom_rule, the custom rule id.",
+            "custom_rule_id": "Required for target_type=custom_rule; otherwise blank.",
+            "replacement_for": "Exact pattern string from editable_candidates.pattern that this proposal replaces.",
+            "pattern": "Replacement regex. It must not match report.normalized_content.",
+            "reason": "Use the existing candidate reason.",
+            "exact_values": "Always return an empty array for false positives.",
+            "description": "Short explanation of the narrowing change.",
+            "rationale": "Why the replacement reduces this false positive without weakening spam coverage too broadly.",
+            "confidence": "low, medium, or high",
+            "tests": [
+                {"text": "the false-positive sample", "should_match": False, "note": "reported legitimate sample"},
+                {"text": "a spam example that should still match", "should_match": True, "note": "coverage retained"},
+            ],
+            "enhancement_prompt": "Optional follow-up prompt for improving the replacement.",
+        },
+        "constraints": [
+            "Only replace one regex listed in editable_candidates.",
+            "Do not propose changes to hardcoded/static detector regexes.",
+            "Do not propose broad allowlists or user-specific exceptions.",
+            "The replacement regex must compile under SpamFighter dynamic regex safety rules.",
+            "The replacement must make the reported false-positive sample no longer match the full detector.",
+            "Positive tests should remain matched through the full detector after the replacement.",
+            "Return JSON only with no markdown fences.",
+        ],
+    }
+    prompt = json.dumps(payload, indent=2)
+    if len(prompt) <= AI_REVIEW_MAX_INPUT_CHARS:
+        return prompt
+
+    payload["report"]["message_content"] = trim_for_ai(content, limit=800)
+    payload["report"]["media_indicators"] = trim_for_ai(media, limit=800)
+    payload["report"]["staff_notes"] = trim_for_ai(payload["report"]["staff_notes"], limit=500)
+    return json.dumps(payload, indent=2)
+
+
 def extract_first_json_object(text: str) -> str:
     text = text.strip()
     if text.startswith("{") and text.endswith("}"):
@@ -6404,6 +7018,7 @@ def normalize_rule_suggestion_payload(payload: dict, raw_payload: str, usage: Op
     reason = str(payload.get("reason", "")).strip()
     pattern = str(payload.get("pattern", "")).strip()
     custom_rule_id = str(payload.get("custom_rule_id", "")).strip()
+    replacement_for = str(payload.get("replacement_for", "")).strip()
     raw_exact_values = payload.get("exact_values", [])
     if isinstance(raw_exact_values, str):
         raw_exact_values = [raw_exact_values]
@@ -6415,6 +7030,8 @@ def normalize_rule_suggestion_payload(payload: dict, raw_payload: str, usage: Op
             continue
         if cleaned.lower().startswith("sha256:"):
             cleaned = "sha256:" + cleaned.split(":", 1)[1].strip().lower()
+        elif cleaned.lower().startswith("phash:"):
+            cleaned = "phash:" + cleaned.split(":", 1)[1].strip().lower()
         exact_values.append(cleaned)
 
     if decision not in {"ignore", "propose"}:
@@ -6441,6 +7058,9 @@ def normalize_rule_suggestion_payload(payload: dict, raw_payload: str, usage: Op
                 digest = value.split(":", 1)[1].strip().lower()
                 if not re.fullmatch(r"[a-f0-9]{64}", digest):
                     raise ValueError(f"Artifact sha256 value is invalid: {value!r}")
+            elif value.lower().startswith("phash:"):
+                if parse_phash_hex(value) is None:
+                    raise ValueError(f"Artifact phash value is invalid: {value!r}")
     elif target_type == "hook":
         if target_name not in MANAGED_RULE_HOOK_NAMES:
             raise ValueError(f"Unsupported managed hook {target_name!r} in model output")
@@ -6476,6 +7096,7 @@ def normalize_rule_suggestion_payload(payload: dict, raw_payload: str, usage: Op
         pattern=pattern,
         exact_values=exact_values,
         custom_rule_id=custom_rule_id,
+        replacement_for=replacement_for,
         description=str(payload.get("description", "")).strip(),
         rationale=str(payload.get("rationale", "")).strip(),
         confidence=str(payload.get("confidence", "")).strip(),
@@ -6497,19 +7118,29 @@ async def request_openai_rule_suggestion(
             "Missing OPENAI API key. Set SPAMFIGHTER_OPENAI_API_KEY or OPENAI_API_KEY, or mount a secret file via the matching *_FILE variable."
         )
 
-    prompt_text = build_openai_rule_prompt(report)
+    false_positive = is_false_positive_report(report)
+    prompt_text = build_openai_false_positive_prompt(report) if false_positive else build_openai_rule_prompt(report)
     if force_propose:
-        prompt_text += (
-            "\n\nSTRICT REQUIREMENT:\n"
-            "- decision must be \"propose\".\n"
-            "- decision \"ignore\" is invalid for this request.\n"
-            "- The proposal must make the full detector classify this report as matched.\n"
-        )
+        if false_positive:
+            prompt_text += (
+                "\n\nSTRICT REQUIREMENT:\n"
+                "- decision must be \"propose\" if any editable candidate can be safely narrowed.\n"
+                "- target_type must be \"hook\" or \"custom_rule\".\n"
+                "- replacement_for must exactly match one editable candidate pattern.\n"
+                "- pattern is the replacement regex and must make the full detector stop matching this false-positive report.\n"
+            )
+        else:
+            prompt_text += (
+                "\n\nSTRICT REQUIREMENT:\n"
+                "- decision must be \"propose\".\n"
+                "- decision \"ignore\" is invalid for this request.\n"
+                "- The proposal must make the full detector classify this report as matched.\n"
+            )
     if retry_feedback.strip():
         prompt_text += (
             "\n\nRETRY FEEDBACK FROM VALIDATOR:\n"
             f"{retry_feedback.strip()}\n"
-            "- Propose a different minimal safe rule that satisfies full-detector matching."
+            "- Propose a different minimal safe rule that satisfies full-detector validation."
         )
     if len(prompt_text) > AI_REVIEW_MAX_INPUT_CHARS:
         raise RuntimeError("The AI proposal prompt is still too large after trimming. Shorten the report before sending it to OpenAI.")
@@ -6978,6 +7609,12 @@ def suggestion_status_label(report: RuleReportState) -> str:
             return "Actioned"
         if report.status == "denied":
             return "Closed"
+        if report.status == "proposal_ready":
+            return "Fix Ready"
+        if report.status == "proposal_error":
+            return "Fix Error"
+        if report.status == "analyzing":
+            return "Drafting Fix"
         return "Reported"
     if report.status == "approved":
         return "Approved"
@@ -6995,7 +7632,9 @@ def suggestion_status_label(report: RuleReportState) -> str:
 def suggestion_source_label(suggestion: RuleSuggestion) -> str:
     if suggestion.usage:
         return "AI"
-    if suggestion.target_type == "artifact" and suggestion.exact_values and all(value.lower().startswith("sha256:") for value in suggestion.exact_values):
+    if suggestion.target_type == "artifact" and suggestion.exact_values and all(
+        value.lower().startswith(("sha256:", "phash:")) for value in suggestion.exact_values
+    ):
         return "Image Hashes"
     return "Manual"
 
@@ -7015,6 +7654,8 @@ def build_rule_draft_summary_text(report: RuleReportState, suggestion: RuleSugge
         f"Confidence: {suggestion.confidence or 'unknown'}",
         f"Target: {suggestion_target_label(suggestion)}",
     ]
+    if suggestion.replacement_for:
+        lines.append(f"Replaces: {suggestion.replacement_for}")
     if report.proposal_generated_at is not None:
         lines.append(f"Generated: {pretty_ts(report.proposal_generated_at, 'F')}")
     return "\n".join(lines)
@@ -7040,7 +7681,8 @@ def build_rule_draft_usage_text(suggestion: RuleSuggestion) -> str:
 
 
 def build_rule_draft_estimated_cost_text(report: RuleReportState) -> str:
-    estimated_prompt_tokens = estimate_rule_review_prompt_tokens(report)
+    user_prompt = build_openai_false_positive_prompt(report) if is_false_positive_report(report) else build_openai_rule_prompt(report)
+    estimated_prompt_tokens = estimate_ai_input_tokens(OPENAI_RULE_SYSTEM_PROMPT) + estimate_ai_input_tokens(user_prompt)
     return (
         f"Prompt tokens: ~{estimated_prompt_tokens}\n"
         + "\n".join(build_ai_cost_estimate_lines(estimated_prompt_tokens))
@@ -7367,9 +8009,11 @@ async def refresh_rule_report_image_hashes(report: RuleReportState) -> List[str]
     if message is None:
         return hashes
 
-    hashes = await compute_message_image_hashes(message)
+    hashes, phashes = await compute_message_image_hash_pairs(message)
     if hashes:
         report.image_hashes = trim_unique_list([*hashes, *report.image_hashes], limit=8)
+    if phashes:
+        report.image_phashes = trim_unique_list([*phashes, *report.image_phashes], limit=8)
     if not report.media_indicators:
         report.media_indicators = render_message_media_indicators(message)
     if not report.message_content and message.content:
@@ -7382,7 +8026,10 @@ async def refresh_rule_report_image_hashes(report: RuleReportState) -> List[str]
 def suggestion_requires_image_hash_validation(suggestion: Optional[RuleSuggestion]) -> bool:
     if suggestion is None or suggestion.decision != "propose" or suggestion.target_type != "artifact":
         return False
-    return any(str(value).strip().lower().startswith("sha256:") for value in suggestion.exact_values)
+    return any(
+        str(value).strip().lower().startswith(("sha256:", "phash:"))
+        for value in suggestion.exact_values
+    )
 
 
 def build_validation_hit_line(message: discord.Message, reason: str) -> str:
@@ -7416,9 +8063,9 @@ async def run_rule_validation_gate(report: RuleReportState) -> Tuple[bool, str, 
     months, channel_ids = await get_validation_channel_config(validation_guild_id)
     if not channel_ids:
         command_hint = (
-            "Ask an admin to run `/spamfighter reviews set-validation-channels` in the validation master guild first."
+            "Ask an admin to run `/sf-reviews set-validation-channels` in the validation master guild first."
             if REPORT_VALIDATION_MASTER_GUILD_ID
-            else "Ask an admin to run `/spamfighter reviews set-validation-channels` first."
+            else "Ask an admin to run `/sf-reviews set-validation-channels` first."
         )
         report.validation_status = "blocked"
         report.validation_summary = f"No validation channels are configured for the {validation_scope}. {command_hint}"
@@ -7462,11 +8109,15 @@ async def run_rule_validation_gate(report: RuleReportState) -> Tuple[bool, str, 
                 if baseline_match:
                     baseline_matches += 1
                     continue
-                image_hashes = await compute_message_image_hashes(message) if needs_image_hashes else []
+                if needs_image_hashes:
+                    image_hashes, image_phashes = await compute_message_image_hash_pairs(message)
+                else:
+                    image_hashes, image_phashes = [], []
                 candidate_match, candidate_reason, _ = classify_candidate_content_and_media(
                     content=message.content or "",
                     media_indicators=render_message_media_indicators(message),
                     image_hashes=image_hashes,
+                    image_phashes=image_phashes,
                     suggestion=report.suggestion,
                     compiled_suggestion=compiled_suggestion,
                 )
@@ -7505,15 +8156,20 @@ async def run_rule_validation_gate(report: RuleReportState) -> Tuple[bool, str, 
     return True, report.validation_summary, []
 
 
-def build_image_hash_rule_suggestion(report: RuleReportState, digests: Sequence[str]) -> RuleSuggestion:
+def build_image_hash_rule_suggestion(
+    report: RuleReportState,
+    digests: Sequence[str],
+    phashes: Sequence[str] = (),
+) -> RuleSuggestion:
     exact_values = [f"sha256:{digest}" for digest in digests]
+    exact_values.extend(f"phash:{value}" for value in phashes)
     payload = {
         "decision": "propose",
         "target_type": "artifact",
         "reason": "known_spam_artifact",
         "exact_values": exact_values,
-        "description": f"Add {len(exact_values)} exact image hash value(s) from the reported spam media.",
-        "rationale": "Exact SHA-256 image hashes only match identical files, making this a low-risk way to catch repeated spam images without broadening text rules.",
+        "description": f"Add {len(exact_values)} known image hash value(s) ({len(digests)} SHA-256, {len(phashes)} perceptual) from the reported spam media.",
+        "rationale": "Exact SHA-256 image hashes only match identical files, and perceptual (pHash) values only match near-identical images above the configured similarity threshold, making this a low-risk way to catch repeated spam images without broadening text rules.",
         "confidence": "high",
         "tests": [
             {
@@ -7638,10 +8294,118 @@ def suggestion_to_mutation_summary(suggestion: RuleSuggestion) -> str:
     if suggestion.target_type == "artifact":
         return f"artifact values={len(suggestion.exact_values)}"
     if suggestion.target_type == "hook":
+        if suggestion.replacement_for:
+            return f"hook {suggestion.target_name} replacement"
         return f"hook {suggestion.target_name}"
     if suggestion.target_type == "custom_rule":
+        if suggestion.replacement_for:
+            return f"custom_rule {suggestion.custom_rule_id} replacement"
         return f"custom_rule {suggestion.custom_rule_id}"
     return "no-op"
+
+
+def build_false_positive_replacement_config(suggestion: RuleSuggestion) -> SpamRulesConfig:
+    replacement_for = str(suggestion.replacement_for or "").strip()
+    replacement_pattern = str(suggestion.pattern or "").strip()
+    if suggestion.decision != "propose":
+        raise ValueError("False-positive adjustments require a proposed replacement.")
+    if not replacement_for:
+        raise ValueError("False-positive adjustments must include replacement_for.")
+    if not replacement_pattern:
+        raise ValueError("False-positive adjustments must include a replacement regex pattern.")
+    if replacement_pattern == replacement_for:
+        raise ValueError("The replacement regex is identical to the existing regex.")
+
+    hooks = {name: tuple(values) for name, values in SPAM_RULES.hooks.items()}
+    custom_rules = list(SPAM_RULES.custom_rules)
+
+    if suggestion.target_type == "hook":
+        hook_name = suggestion.target_name
+        if hook_name not in MANAGED_RULE_HOOK_NAMES:
+            raise ValueError(f"Unsupported hook target {hook_name!r}.")
+        values = list(hooks.get(hook_name, tuple()))
+        try:
+            index = values.index(replacement_for)
+        except ValueError as exc:
+            raise ValueError("replacement_for does not match an existing managed hook regex.") from exc
+        values[index] = replacement_pattern
+        hooks[hook_name] = tuple(values)
+    elif suggestion.target_type == "custom_rule":
+        rule_id = suggestion.custom_rule_id or suggestion.target_name
+        replaced = False
+        updated_rules: List[ManagedCustomRule] = []
+        for rule in custom_rules:
+            if rule.rule_id == rule_id and rule.pattern == replacement_for:
+                updated_rules.append(
+                    ManagedCustomRule(
+                        rule_id=rule.rule_id,
+                        reason=rule.reason,
+                        pattern=replacement_pattern,
+                        enabled=rule.enabled,
+                        description=suggestion.description or rule.description,
+                        source=rule.source,
+                        created_at=rule.created_at,
+                        approved_by=rule.approved_by,
+                        report_id=rule.report_id,
+                    )
+                )
+                replaced = True
+            else:
+                updated_rules.append(rule)
+        if not replaced:
+            raise ValueError("replacement_for does not match the targeted managed custom rule.")
+        custom_rules = updated_rules
+    else:
+        raise ValueError("False-positive adjustments can only replace a hook or custom_rule regex.")
+
+    candidate = SpamRulesConfig(
+        schema_version=SPAM_RULES.schema_version,
+        artifact_values=SPAM_RULES.artifact_values,
+        image_hashes=SPAM_RULES.image_hashes,
+        hooks=hooks,
+        custom_rules=tuple(custom_rules),
+    )
+    validate_spam_rules(candidate)
+    return candidate
+
+
+def evaluate_rules_config_against_report(config: SpamRulesConfig, report: RuleReportState) -> Tuple[bool, str, str]:
+    previous_rules = SPAM_RULES
+    try:
+        apply_spam_rules(config)
+        return classify_rule_report_against_current_matcher(report)
+    finally:
+        apply_spam_rules(previous_rules)
+
+
+def validate_false_positive_replacement(report: RuleReportState, suggestion: RuleSuggestion) -> SpamRulesConfig:
+    if not is_false_positive_report(report):
+        raise ValueError("This validator only handles false-positive reviews.")
+    candidate_config = build_false_positive_replacement_config(suggestion)
+    matched, reason, _ = evaluate_rules_config_against_report(candidate_config, report)
+    if matched:
+        raise RuleSuggestionGenerationError(
+            f"The proposed replacement still matches the false-positive sample as {reason or 'unknown'}."
+        )
+
+    previous_rules = SPAM_RULES
+    try:
+        apply_spam_rules(candidate_config)
+        for test in suggestion.tests:
+            text = str(test.get("text", "")).strip()
+            if not text:
+                continue
+            expected = bool(test.get("should_match", False))
+            test_matched, _, _ = classify_candidate_content_and_media(content=text)
+            if test_matched != expected:
+                expected_label = "match" if expected else "not match"
+                raise RuleSuggestionGenerationError(
+                    f"Suggested test failed after replacement: expected {expected_label} for {text[:120]!r}."
+                )
+    finally:
+        apply_spam_rules(previous_rules)
+
+    return candidate_config
 
 
 async def apply_suggestion_to_spam_rules(report: RuleReportState, approver_id: int) -> str:
@@ -7664,17 +8428,52 @@ async def apply_suggestion_to_spam_rules(report: RuleReportState, approver_id: i
         artifacts.setdefault("values", [])
         image_hashes = raw.setdefault("image_hashes", {})
         image_hashes.setdefault("sha256", [])
+        image_hashes.setdefault("phash", [])
         custom_rules = raw.setdefault("custom_rules", [])
+
+        if is_false_positive_report(report):
+            if suggestion.target_type == "hook":
+                values = hooks.setdefault(suggestion.target_name, [])
+                try:
+                    index = values.index(suggestion.replacement_for)
+                except ValueError as exc:
+                    raise ValueError("replacement_for does not match an existing managed hook regex.") from exc
+                values[index] = suggestion.pattern
+                return
+
+            if suggestion.target_type == "custom_rule":
+                rule_id = suggestion.custom_rule_id or suggestion.target_name
+                for item in custom_rules:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("id", "")).strip() == rule_id and str(item.get("pattern", "")).strip() == suggestion.replacement_for:
+                        item["pattern"] = suggestion.pattern
+                        if suggestion.description:
+                            item["description"] = suggestion.description
+                        item["source"] = "openai-false-positive-adjustment"
+                        item["approved_by"] = str(approver_id)
+                        item["report_id"] = report.report_id
+                        return
+                raise ValueError("replacement_for does not match the targeted managed custom rule.")
+
+            raise ValueError("False-positive adjustments can only replace a hook or custom_rule regex.")
 
         if suggestion.target_type == "artifact":
             existing = {str(value).strip() for value in artifacts.get("values", [])}
             existing_hashes = {str(value).strip().lower() for value in image_hashes.get("sha256", [])}
+            existing_phashes = {str(value).strip().lower() for value in image_hashes.get("phash", [])}
             for value in suggestion.exact_values:
                 if value.lower().startswith("sha256:"):
                     digest = value.split(":", 1)[1].strip().lower()
                     if re.fullmatch(r"[a-f0-9]{64}", digest) and digest not in existing_hashes:
                         image_hashes["sha256"].append(digest)
                         existing_hashes.add(digest)
+                    continue
+                if value.lower().startswith("phash:"):
+                    phash_hex = value.split(":", 1)[1].strip().lower()
+                    if re.fullmatch(r"[a-f0-9]{64}", phash_hex) and phash_hex not in existing_phashes:
+                        image_hashes["phash"].append(phash_hex)
+                        existing_phashes.add(phash_hex)
                     continue
                 if value not in existing:
                     artifacts["values"].append(value)
@@ -7710,6 +8509,141 @@ async def apply_suggestion_to_spam_rules(report: RuleReportState, approver_id: i
     return suggestion_to_mutation_summary(suggestion)
 
 
+async def enforce_approved_report(report: RuleReportState) -> str:
+    guild = bot.get_guild(report.source_guild_id)
+    if guild is None:
+        return "source guild is not available; nothing was actioned"
+
+    settings = resolve_moderation_settings(guild.id)
+    effective_dry_run = SPAM_DRY_RUN or not settings.enable_deletion
+    reason = f"approved_report:{report.report_id}"
+
+    targets: "OrderedDict[int, int]" = OrderedDict()
+    if report.source_message_id > 0 and report.source_channel_id > 0:
+        targets[report.source_message_id] = report.source_channel_id
+    for jump_url in report.sample_jump_urls:
+        ref = resolve_discord_message_ref(jump_url)
+        if ref is None:
+            continue
+        ref_guild_id, ref_channel_id, ref_message_id = ref
+        if ref_guild_id != guild.id or ref_message_id <= 0:
+            continue
+        targets.setdefault(ref_message_id, ref_channel_id)
+
+    if not targets:
+        return "no source messages could be resolved for retro enforcement"
+
+    deleted = 0
+    dry_run_matches = 0
+    already_gone = 0
+    delete_failures = 0
+    author_actioned_counts: Dict[int, int] = {}
+    author_final_counts: Dict[int, int] = {}
+    author_members: Dict[int, discord.Member] = {}
+
+    for message_id, channel_id in targets.items():
+        channel = await fetch_messageable_channel(channel_id)
+        if channel is None:
+            already_gone += 1
+            continue
+        try:
+            message = await channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            already_gone += 1
+            continue
+
+        author_id = message.author.id
+        if isinstance(message.author, discord.Member):
+            author_members.setdefault(author_id, message.author)
+        normalized = normalize_for_scan(message.content or "")
+
+        if effective_dry_run:
+            dry_run_matches += 1
+            projected_count = await get_violation_count(guild.id, author_id) + 1
+            try:
+                await audit_message_deletion(message, reason, normalized, deleted=False, violation_count=projected_count, image_hashes=report.image_hashes)
+                await enforcement_log_deletion(message, reason, projected_count, deleted=False, image_hashes=report.image_hashes)
+            except Exception:
+                log.exception("Failed to log retro dry-run match for report %s", report.report_id)
+            continue
+
+        try:
+            await message.delete()
+        except discord.NotFound:
+            already_gone += 1
+            continue
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            delete_failures += 1
+            await audit_error(
+                guild,
+                "Retro Enforcement Delete Failed",
+                "enforce_approved_report.delete",
+                exc,
+                extra={
+                    "Report": report.report_id,
+                    "Channel": str(channel_id),
+                    "Message": str(message_id),
+                    "Author": str(author_id),
+                },
+            )
+            continue
+
+        deleted += 1
+        STATE.deleted_messages += 1
+        violation_count = await increment_violation_count(guild.id, author_id)
+        author_actioned_counts[author_id] = author_actioned_counts.get(author_id, 0) + 1
+        author_final_counts[author_id] = violation_count
+        try:
+            await audit_message_deletion(message, reason, normalized, deleted=True, violation_count=violation_count, image_hashes=report.image_hashes)
+            await enforcement_log_deletion(message, reason, violation_count, deleted=True, image_hashes=report.image_hashes)
+        except Exception:
+            log.exception("Failed to log retro deletion for report %s", report.report_id)
+
+    escalations: List[str] = []
+    members_missing = 0
+    if not effective_dry_run:
+        for author_id, actioned in author_actioned_counts.items():
+            if actioned <= 0:
+                continue
+            member = author_members.get(author_id) or guild.get_member(author_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(author_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+            if member is None:
+                members_missing += 1
+                continue
+            try:
+                action = await escalate_member_for_violations(
+                    guild,
+                    member,
+                    author_final_counts.get(author_id, actioned),
+                    context=f"Retro enforcement for approved report {report.report_id}",
+                )
+            except Exception:
+                log.exception("Retro escalation failed for user %s in report %s", author_id, report.report_id)
+                continue
+            if action:
+                escalations.append(f"{action} applied to <@{author_id}>")
+
+    parts: List[str] = []
+    if effective_dry_run:
+        mode = "dry-run mode" if SPAM_DRY_RUN else "deletion disabled for this guild"
+        parts.append(f"{mode}: {dry_run_matches}/{len(targets)} message(s) matched, none deleted")
+    else:
+        parts.append(f"deleted {deleted}/{len(targets)} message(s)")
+    if already_gone:
+        parts.append(f"{already_gone} already gone")
+    if delete_failures:
+        parts.append(f"{delete_failures} delete failure(s)")
+    if escalations:
+        parts.append("; ".join(escalations))
+    if members_missing:
+        parts.append(f"{members_missing} member(s) no longer in the guild (escalation skipped)")
+    return ", ".join(parts)
+
+
 async def finalize_rule_approval(report: RuleReportState, approver_id: int) -> str:
     validate_rule_deployment_approval(report, approver_id)
     summary = await apply_suggestion_to_spam_rules(report, approver_id)
@@ -7727,6 +8661,21 @@ async def finalize_rule_approval(report: RuleReportState, approver_id: int) -> s
         actor_id=approver_id,
         details=f"Approved rule proposal and reloaded spam rules ({summary}).",
     )
+    if not is_false_positive_report(report) and report.source_guild_id > 0:
+        try:
+            retro_summary = await enforce_approved_report(report)
+        except Exception as exc:
+            log.exception("Retro enforcement failed for report %s", report.report_id)
+            retro_summary = f"failed: {exc}"
+        try:
+            await log_rule_review_action(
+                report,
+                action="retro_enforced",
+                actor_id=approver_id,
+                details=f"Retro enforcement in the source guild: {retro_summary}.",
+            )
+        except Exception:
+            log.exception("Failed to log retro enforcement outcome for report %s", report.report_id)
     return summary
 
 
@@ -7888,6 +8837,31 @@ async def run_rule_suggestion(report_id: str) -> None:
         report.current_matched = precheck_matched
         report.current_reason = precheck_reason
 
+        if is_false_positive_report(report):
+            if not precheck_matched:
+                raise RuleSuggestionGenerationError("This false-positive sample no longer matches the current detector.")
+            if not build_false_positive_edit_candidates(report):
+                raise RuleSuggestionGenerationError(
+                    "This false positive appears to come from static detector logic or a domain blocklist, not an editable managed regex."
+                )
+
+            suggestion = await request_openai_rule_suggestion(report, force_propose=True)
+            if suggestion.decision != "propose":
+                raise RuleSuggestionGenerationError(
+                    "AI did not produce an editable false-positive regex adjustment.",
+                    usage=suggestion.usage,
+                )
+            validate_false_positive_replacement(report, suggestion)
+            report.suggestion = suggestion
+            report.suggestion_error = None
+            report.proposal_generated_at = utcnow()
+            report.status = "proposal_ready"
+            if report.suggestion.usage:
+                await record_ai_usage(report.suggestion.usage)
+                if report.last_generated_by is not None:
+                    await log_ai_usage(report, report.suggestion.usage, report.last_generated_by)
+            return
+
         retry_feedback = ""
         final_suggestion: Optional[RuleSuggestion] = None
         last_failed_candidate = ""
@@ -7915,6 +8889,7 @@ async def run_rule_suggestion(report_id: str) -> None:
                 content=report.message_content,
                 media_indicators=report.media_indicators,
                 image_hashes=report.image_hashes,
+                image_phashes=report.image_phashes,
                 suggestion=suggestion,
                 compiled_suggestion=compiled_suggestion,
             )
@@ -7939,6 +8914,7 @@ async def run_rule_suggestion(report_id: str) -> None:
                     content=report.message_content,
                     media_indicators=report.media_indicators,
                     image_hashes=report.image_hashes,
+                    image_phashes=report.image_phashes,
                     suggestion=fallback_suggestion,
                     compiled_suggestion=fallback_compiled,
                 )
@@ -8000,11 +8976,18 @@ async def run_rule_suggestion_with_notification(report_id: str, interaction: dis
         if report.status == "proposal_ready" and report.suggestion is not None:
             suggestion = report.suggestion
             if suggestion.decision == "propose":
-                completion_text = (
-                    f"AI rule drafting completed for `{report.report_id}`. "
-                    f"It proposed `{suggestion_target_label(suggestion)}` for `{suggestion.reason or 'none'}`. "
-                    "The full parsed draft now appears in dedicated detail embeds below the review entry."
-                )
+                if is_false_positive_report(report):
+                    completion_text = (
+                        f"AI false-positive regex adjustment completed for `{report.report_id}`. "
+                        f"It proposed replacing `{suggestion_target_label(suggestion)}` for `{suggestion.reason or 'none'}`. "
+                        "The full parsed draft now appears in dedicated detail embeds below the review entry."
+                    )
+                else:
+                    completion_text = (
+                        f"AI rule drafting completed for `{report.report_id}`. "
+                        f"It proposed `{suggestion_target_label(suggestion)}` for `{suggestion.reason or 'none'}`. "
+                        "The full parsed draft now appears in dedicated detail embeds below the review entry."
+                    )
             else:
                 completion_text = (
                     f"AI rule drafting completed for `{report.report_id}`. "
@@ -8017,7 +9000,7 @@ async def run_rule_suggestion_with_notification(report_id: str, interaction: dis
             if len(error_text) > 700:
                 error_text = error_text[:700].rstrip() + "..."
             await interaction.followup.send(
-                f"AI rule drafting failed for `{report.report_id}`: {error_text}",
+                f"AI {'false-positive adjustment' if is_false_positive_report(report) else 'rule drafting'} failed for `{report.report_id}`: {error_text}",
                 ephemeral=True,
             )
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -8032,7 +9015,7 @@ async def prepare_rule_report_candidate(message: discord.Message) -> PreparedRul
         force_image_hashes=True,
     )
     normalized = normalized or normalize_for_scan(message.content or media_indicators)
-    image_hashes = await compute_message_image_hashes(message)
+    image_hashes, image_phashes = await compute_message_image_hash_pairs(message)
     cluster_key = build_report_cluster_key(normalized, media_indicators, image_hashes)
     return PreparedRuleReportCandidate(
         matched=matched,
@@ -8041,6 +9024,7 @@ async def prepare_rule_report_candidate(message: discord.Message) -> PreparedRul
         media_indicators=media_indicators,
         image_hashes=image_hashes,
         cluster_key=cluster_key,
+        image_phashes=image_phashes,
     )
 
 
@@ -8093,6 +9077,7 @@ def classify_rule_report_against_current_matcher(report: RuleReportState) -> Tup
         content=report.message_content,
         media_indicators=report.media_indicators,
         image_hashes=report.image_hashes,
+        image_phashes=report.image_phashes,
     )
     if matched:
         return matched, reason, normalized
@@ -8153,7 +9138,7 @@ async def create_or_update_manual_rule_report(
     submitter_label = format_known_user(interaction.guild.id, interaction.user.id)
     source_author_label = f"External sample submitted by {submitter_label}"
     staff_notes = (
-        "Manual sample submitted via `/spamfighter reviews report-new`.\n"
+        "Manual sample submitted via `/sf-reviews report-new`.\n"
         "No Discord message was actioned. This review was seeded from administrator-provided text."
     )
 
@@ -8301,6 +9286,7 @@ async def create_or_update_rule_report(
     reason = prepared.reason
     normalized = prepared.normalized
     image_hashes = prepared.image_hashes
+    image_phashes = prepared.image_phashes
     now = datetime.now(timezone.utc)
 
     async with RULE_REPORTS_LOCK:
@@ -8317,6 +9303,8 @@ async def create_or_update_rule_report(
             report.media_indicators = media_indicators or report.media_indicators
             if image_hashes:
                 report.image_hashes = trim_unique_list([*image_hashes, *report.image_hashes], limit=8)
+            if image_phashes:
+                report.image_phashes = trim_unique_list([*image_phashes, *report.image_phashes], limit=8)
             report.current_matched = matched
             report.current_reason = reason
             report.validation_status = "not_run"
@@ -8350,6 +9338,8 @@ async def create_or_update_rule_report(
                     report.media_indicators = media_indicators
                 if image_hashes:
                     report.image_hashes = trim_unique_list([*image_hashes, *report.image_hashes], limit=8)
+                if image_phashes:
+                    report.image_phashes = trim_unique_list([*image_phashes, *report.image_phashes], limit=8)
                 report.current_matched = report.current_matched or matched
                 if reason:
                     report.current_reason = reason
@@ -8379,6 +9369,7 @@ async def create_or_update_rule_report(
             normalized_content=normalized,
             media_indicators=media_indicators,
             image_hashes=image_hashes,
+            image_phashes=image_phashes,
             reporter_ids={interaction.user.id},
             last_reported_at=now,
             report_count=1,
@@ -8438,8 +9429,8 @@ class RuleReviewView(discord.ui.View):
         if report is None or is_false_positive_report(report) or report.validation_status != "failed":
             self.remove_item(self.bypass_validation)
         if report is not None and is_false_positive_report(report):
-            self.remove_item(self.generate_rule)
-            self.remove_item(self.approve_rule)
+            self.remove_item(self.approve_ignore)
+            self.generate_rule.label = "Draft Fix with AI"
             self.deny_rule.label = "Close Review"
             self.deny_rule.style = discord.ButtonStyle.secondary
 
@@ -8488,9 +9479,6 @@ class RuleReviewView(discord.ui.View):
         report = RULE_REPORTS.get(self.report_id)
         if report is None:
             await respond_ephemeral(interaction, content="That report is no longer available.")
-            return
-        if is_false_positive_report(report):
-            await respond_ephemeral(interaction, content="False-positive reviews are reviewed manually. They do not generate deployable AI rule drafts.")
             return
         if report.status == "approved":
             await respond_ephemeral(interaction, content="That rule draft has already been approved.")
@@ -8544,7 +9532,11 @@ class RuleReviewView(discord.ui.View):
             report,
             action="generated",
             actor_id=interaction.user.id,
-            details="Started AI rule drafting for the reported message.",
+            details=(
+                "Started AI false-positive regex adjustment."
+                if is_false_positive_report(report)
+                else "Started AI rule drafting for the reported message."
+            ),
         )
 
     @discord.ui.button(label="Create Exact Image Hash Rule", style=discord.ButtonStyle.secondary, custom_id="spamfighter:rule-review:hash-images")
@@ -8584,18 +9576,20 @@ class RuleReviewView(discord.ui.View):
             return
 
         new_hashes = [digest for digest in hashes if digest.lower() not in MANAGED_KNOWN_IMAGE_HASHES]
+        known_phashes = {value.lower() for value in SPAM_RULES.image_phashes}
+        new_phashes = [value for value in report.image_phashes if value.lower() not in known_phashes]
         channel = await fetch_messageable_channel(report.review_channel_id) if report.review_channel_id else None
         if channel is not None:
             await sync_rule_report_detail_messages(channel, report)
 
-        if not new_hashes:
+        if not new_hashes and not new_phashes:
             await persist_rule_report_state(report)
             await refresh_rule_review_message(report)
             await interaction.followup.send("These image hashes are already stored as known spam hashes.", ephemeral=True)
             return
 
         report.status = "proposal_ready"
-        report.suggestion = build_image_hash_rule_suggestion(report, new_hashes)
+        report.suggestion = build_image_hash_rule_suggestion(report, new_hashes, new_phashes)
         report.suggestion_error = None
         report.proposal_generated_at = utcnow()
         report.validation_status = "not_run"
@@ -8667,9 +9661,6 @@ class RuleReviewView(discord.ui.View):
         if report is None:
             await respond_ephemeral(interaction, content="That report is no longer available.")
             return
-        if is_false_positive_report(report):
-            await respond_ephemeral(interaction, content="False-positive reviews are closed manually instead of being approved and deployed.")
-            return
         if report.status == "approved":
             await respond_ephemeral(interaction, content="That rule draft has already been approved.")
             return
@@ -8695,6 +9686,31 @@ class RuleReviewView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True)
+        if is_false_positive_report(report):
+            try:
+                validate_false_positive_replacement(report, report.suggestion)
+            except Exception as exc:
+                await interaction.followup.send(f"False-positive replacement validation failed: {exc}", ephemeral=True)
+                await log_rule_review_action(
+                    report,
+                    action="validated",
+                    actor_id=interaction.user.id,
+                    details=f"False-positive replacement blocked deployment: {exc}",
+                )
+                return
+
+            confirm_view = RuleDeploymentConfirmView(report.report_id, interaction.user.id)
+            await interaction.followup.send(
+                (
+                    "False-positive replacement validation passed. "
+                    f"Active draft: target `{suggestion_target_label(report.suggestion)}`. "
+                    "Confirm approve/deploy will replace the matched managed regex."
+                ),
+                ephemeral=True,
+                view=confirm_view,
+            )
+            return
+
         needs_validation = (
             report.validation_status not in {"passed", "bypassed"}
             or report.validation_ran_at is None
@@ -8992,7 +10008,7 @@ class SetupDashboardView(discord.ui.View):
             interaction,
             description=(
                 f"Created or re-used {audit_channel.mention} and {enforcement_channel.mention}. "
-                "This configuration has already been written to config.toml."
+                "This configuration has already been saved for this guild."
             ),
         )
         await audit_control_action(
@@ -9164,22 +10180,21 @@ async def maybe_warn_member(member: discord.Member, guild: discord.Guild, violat
     await send_enforcement_embeds(guild, [action])
 
 
-async def maybe_escalate_member(message: discord.Message, violation_count: int) -> None:
-    guild = message.guild
-    if guild is None:
-        return
-    if not isinstance(message.author, discord.Member):
-        return
-
+async def escalate_member_for_violations(
+    guild: discord.Guild,
+    member: discord.Member,
+    violation_count: int,
+    *,
+    context: str = "",
+) -> Optional[str]:
     settings = resolve_moderation_settings(guild.id)
     if not settings.enable_escalation:
-        return
+        return None
 
-    member = message.author
     remember_user_identity(guild.id, member)
     action = await apply_escalation_action(guild, member, violation_count)
     if action is None or action == "warn":
-        return
+        return action
 
     embed = base_embed(
         title="Spam Escalation Action",
@@ -9192,8 +10207,20 @@ async def maybe_escalate_member(message: discord.Message, violation_count: int) 
     embed.add_field(name="Action", value=action, inline=True)
     if action == "timeout":
         embed.add_field(name="Duration", value=f"{settings.timeout_minutes} minutes", inline=True)
+    if context:
+        embed.add_field(name="Context", value=format_embed_field_value(context, limit=300), inline=False)
 
     await send_enforcement_embeds(guild, [embed])
+    return action
+
+
+async def maybe_escalate_member(message: discord.Message, violation_count: int) -> None:
+    guild = message.guild
+    if guild is None:
+        return
+    if not isinstance(message.author, discord.Member):
+        return
+    await escalate_member_for_violations(guild, message.author, violation_count)
 
 
 # ============================================================
@@ -9228,7 +10255,7 @@ class RetroExecuteConfirmView(discord.ui.View):
             embed = build_retro_scan_embed(RETRO_SCAN)
             await respond_ephemeral(
                 interaction,
-                content="A retro scan is already running. Use `/spamfighter retro status` to follow it or `/spamfighter retro cancel` to stop it.",
+                content="A retro scan is already running. Use `/sf-retro status` to follow it or `/sf-retro cancel` to stop it.",
                 embed=embed,
             )
             return
@@ -9248,7 +10275,7 @@ class RetroExecuteConfirmView(discord.ui.View):
         embed = build_retro_scan_embed(scan)
         embed.description = (
             "Retro execute confirmed. It will delete matched messages when possible and apply retroactive moderation. "
-            "Use `/spamfighter retro status` to check progress."
+            "Use `/sf-retro status` to check progress."
         )
         if self.deep_image_hash_scan:
             embed.description += " Exact known image hashes will also be checked during this scan."
@@ -9422,6 +10449,41 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
 
     def __init__(self, bot_client: SpamGuardBot) -> None:
         self.bot = bot_client
+        self.extra_app_command_groups: List[app_commands.Group] = []
+        self._prepare_application_command_layout()
+
+    def _prepare_application_command_layout(self) -> None:
+        root = self.app_command
+        if root is None:
+            return
+
+        split_groups = {
+            "reviews": ("sf-reviews", "SpamFighter review workflow."),
+            "retro": ("sf-retro", "SpamFighter retro scans."),
+            "rules": ("sf-rules", "SpamFighter rule management."),
+        }
+        retired_children = {"allowlist", "set-global-allowlist"}
+        moved_children = set(split_groups) | retired_children
+
+        # Discord rejects large command payloads; keep the root group small by
+        # registering heavy admin areas as separate top-level groups.
+        for old_name, (new_name, description) in split_groups.items():
+            source_group = root._children.pop(old_name, None)
+            if source_group is None:
+                continue
+
+            split_group = app_commands.Group(name=new_name, description=description, guild_only=True)
+            for child in source_group.commands:
+                split_group.add_command(child._copy_with(parent=split_group, binding=self, bindings={self: self}))
+            self.extra_app_command_groups.append(split_group)
+
+        for child_name in retired_children:
+            root._children.pop(child_name, None)
+
+        self.__cog_app_commands__ = [
+            command for command in self.__cog_app_commands__
+            if command.name not in moved_children
+        ]
 
     def _available_command_names(self) -> List[str]:
         names: Set[str] = set()
@@ -9463,17 +10525,17 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
                 "SpamFighter deletes matched spam, tracks repeat offenders, and gives staff a gated workflow for reviewing new spam patterns.\n\n"
                 "Start here:\n"
                 "`/spamfighter status` to check health and runtime state\n"
-                "`/spamfighter reviews show-validation-channels` to review the clean-channel validation corpus\n"
-                "`/spamfighter retro scan` to preview older spam before taking action\n"
+                "`/sf-reviews show-validation-channels` to review the clean-channel validation corpus\n"
+                "`/sf-retro start` to preview older spam before taking action\n"
                 "`SpamFighter AI Report` on a message to open a staff review entry"
             ),
         )
         embed.add_field(name="Live Scanning", value="`/spamfighter scanning pause` and `/spamfighter scanning resume`", inline=False)
         embed.add_field(name="Domain Blocklists", value="`/spamfighter blocklists status`, `/spamfighter blocklists enable`, `/spamfighter blocklists disable`", inline=False)
-        embed.add_field(name="Rule Management", value="`/spamfighter rules list`, `/spamfighter rules disable`, `/spamfighter rules rollback`", inline=False)
+        embed.add_field(name="Rule Management", value="`/sf-rules list`, `/sf-rules disable`, `/sf-rules rollback`", inline=False)
         embed.add_field(name="Validation Workflow", value="Deployments validate drafts against configured known-clean channels before publishing.", inline=False)
-        embed.add_field(name="False Positives", value="`/spamfighter reviews report-false-positive` to send an incorrect match to the master review queue.", inline=False)
-        embed.add_field(name="External Samples", value="`/spamfighter reviews report-new` to seed the review pipeline with spam text that was never posted in a monitored server.", inline=False)
+        embed.add_field(name="False Positives", value="`/sf-reviews report-false-positive` to send an incorrect match to the master review queue.", inline=False)
+        embed.add_field(name="External Samples", value="`/sf-reviews report-new` to seed the review pipeline with spam text that was never posted in a monitored server.", inline=False)
         embed.add_field(name="Per-Guild Command Flags", value="`/spamfighter commands list`, `/spamfighter commands disable`, `/spamfighter commands enable`", inline=False)
         if disabled_commands:
             embed.add_field(
@@ -9719,7 +10781,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
                     report,
                     action="generated",
                     actor_id=interaction.user.id,
-                    details="Started AI rule drafting from `/spamfighter reviews report-new`.",
+                    details="Started AI rule drafting from `/sf-reviews report-new`.",
                 )
                 ai_status = "AI rule drafting started. A follow-up message will be sent when the draft finishes."
 
@@ -9852,6 +10914,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         user_ref="Optional author mention or raw user ID when the original message is already gone",
         message_link="Optional Discord message link if the original message still exists",
         notes="Optional staff notes explaining why this was a false positive",
+        draft_with_ai="Whether SpamFighter should immediately request an AI regex adjustment",
     )
     @guild_only_check()
     @guild_admin_or_super_user_only()
@@ -9862,6 +10925,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         user_ref: Optional[str] = None,
         message_link: Optional[str] = None,
         notes: Optional[str] = None,
+        draft_with_ai: bool = True,
     ) -> None:
         assert interaction.guild is not None
 
@@ -9935,6 +10999,46 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             await audit_error(interaction.guild, "False Positive Report Failed", "report_false_positive", exc)
             return
 
+        ai_status = "Not requested."
+        if draft_with_ai:
+            if not OPENAI_API_KEY:
+                ai_status = "OpenAI is not configured, so the review was created without starting a fix draft."
+            elif not report.current_matched:
+                ai_status = "The sample no longer matches current rules, so no AI fix draft was started."
+            elif report.task is not None or report.status == "analyzing":
+                ai_status = "An AI fix draft was already running for this review."
+            else:
+                report.status = "reported"
+                report.suggestion = None
+                report.suggestion_error = None
+                report.proposal_generated_at = None
+                report.validation_status = "not_run"
+                report.validation_summary = ""
+                report.validation_hit_lines = []
+                report.validation_ran_at = None
+                report.validation_bypassed_by = None
+                report.validation_months = 0
+                report.validation_channel_ids = []
+                report.ai_precheck_matched = False
+                report.ai_precheck_reason = ""
+                report.ai_precheck_normalized = ""
+                report.ai_ignore_approved_by = None
+                report.last_generated_by = interaction.user.id
+                update_rule_report_cluster_map(report)
+                await persist_rule_report_state(report)
+                await refresh_rule_review_message(report)
+                report.task = asyncio.create_task(
+                    run_rule_suggestion_with_notification(report.report_id, interaction),
+                    name=f"spamfighter-rule-review-{report.report_id}",
+                )
+                await log_rule_review_action(
+                    report,
+                    action="generated",
+                    actor_id=interaction.user.id,
+                    details="Started AI false-positive regex adjustment from `/sf-reviews report-false-positive`.",
+                )
+                ai_status = "AI regex adjustment started. A follow-up message will be sent when the draft finishes."
+
         embed = base_embed(
             title="False Positive Submitted",
             color=discord.Color.green(),
@@ -9944,6 +11048,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         embed.add_field(name="Source Guild", value=f"{interaction.guild.name} (`{interaction.guild.id}`)", inline=False)
         embed.add_field(name="Reported User", value=format_known_user(interaction.guild.id, source_author_id), inline=False)
         embed.add_field(name="Matched Current Rules", value=f"{report.current_matched} ({report.current_reason or 'none'})", inline=True)
+        embed.add_field(name="AI Fix", value=format_embed_field_value(ai_status, limit=700), inline=False)
         embed.add_field(name="Review Channel", value=f"<#{REPORT_REVIEW_CHANNEL_ID}>", inline=False)
         await interaction.followup.send(embed=embed, ephemeral=True)
         await audit_control_action(
@@ -9951,7 +11056,8 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             "report-false-positive",
             (
                 f"Submitted false-positive review {report.report_id} for guild {interaction.guild.id} "
-                f"user={source_author_id} matched={report.current_matched} reason={report.current_reason or 'none'}"
+                f"user={source_author_id} matched={report.current_matched} reason={report.current_reason or 'none'} "
+                f"auto_draft={draft_with_ai}"
             ),
         )
 
@@ -9984,7 +11090,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         await respond_ephemeral(interaction, embed=embed)
 
     @commands_cfg.command(name="disable", description="Disable a SpamFighter command or command group for this guild.")
-    @app_commands.describe(command_name="Example: spamfighter retro scan, spamfighter retro, or spamfighter reviews")
+    @app_commands.describe(command_name="Example: sf-retro start, sf-retro, or sf-reviews")
     @guild_only_check()
     @guild_admin_or_super_user_only()
     async def disable_command(self, interaction: discord.Interaction, command_name: str) -> None:
@@ -9992,7 +11098,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
 
         normalized_name = normalize_command_name(command_name)
         if not normalized_name:
-            await respond_ephemeral(interaction, content="Provide a command name such as `spamfighter retro scan` or `spamfighter reviews`.")
+            await respond_ephemeral(interaction, content="Provide a command name such as `sf-retro start` or `sf-reviews`.")
             return
         if normalized_name == "spamfighter" or normalized_name.startswith("spamfighter commands"):
             await respond_ephemeral(interaction, content="The SpamFighter command-management commands cannot be disabled from within the guild.")
@@ -10161,9 +11267,6 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         if report is None:
             await respond_ephemeral(interaction, content="That review report ID was not found.")
             return
-        if is_false_positive_report(report):
-            await respond_ephemeral(interaction, content="False-positive reviews do not currently generate an AI deployment prompt.")
-            return
 
         if not user_can_review_rule_changes_for_report(report, user_id=interaction.user.id):
             await respond_ephemeral(
@@ -10173,7 +11276,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             return
 
         system_prompt = OPENAI_RULE_SYSTEM_PROMPT
-        user_prompt = build_openai_rule_prompt(report)
+        user_prompt = build_openai_false_positive_prompt(report) if is_false_positive_report(report) else build_openai_rule_prompt(report)
         system_chars = len(system_prompt)
         user_chars = len(user_prompt)
         total_chars = system_chars + user_chars
@@ -10298,15 +11401,15 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
                         continue
                     messages_scanned += 1
                     count += 1
-                    image_hashes_for_msg = (
-                        await compute_message_image_hashes(message)
-                        if check_image_hashes
-                        else []
-                    )
+                    if check_image_hashes:
+                        image_hashes_for_msg, image_phashes_for_msg = await compute_message_image_hash_pairs(message)
+                    else:
+                        image_hashes_for_msg, image_phashes_for_msg = [], []
                     matched_pg, reason_pg, normalized_pg = classify_candidate_content_and_media(
                         content=message.content or "",
                         media_indicators=render_message_media_indicators(message),
                         image_hashes=image_hashes_for_msg,
+                        image_phashes=image_phashes_for_msg,
                     )
                     if check_image_hashes:
                         hash_scans += 1
@@ -10511,14 +11614,14 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         try:
             await write_guild_channels(interaction.guild.id, enforcement_channel_id=channel.id)
         except Exception as exc:
-            await interaction.followup.send(f"Failed to update config.toml: {exc}", ephemeral=True)
+            await interaction.followup.send(f"Failed to update enforcement channel: {exc}", ephemeral=True)
             await audit_error(interaction.guild, "Set Enforcement Channel Failed", "set_enforcement_channel", exc)
             return
 
         embed = base_embed(
             title="Enforcement Channel Updated",
             color=discord.Color.green(),
-            description="The enforcement log channel was updated in config.toml and reloaded.",
+            description="The enforcement log channel was updated for this guild.",
         )
         embed.add_field(name="Guild", value=f"{interaction.guild.name} (`{interaction.guild.id}`)", inline=False)
         embed.add_field(name="Channel", value=f"{channel.mention} (`{channel.id}`)", inline=False)
@@ -10542,14 +11645,14 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         try:
             await write_guild_channels(interaction.guild.id, audit_channel_id=channel.id)
         except Exception as exc:
-            await interaction.followup.send(f"Failed to update config.toml: {exc}", ephemeral=True)
+            await interaction.followup.send(f"Failed to update audit channel: {exc}", ephemeral=True)
             await audit_error(interaction.guild, "Set Audit Channel Failed", "set_audit_channel", exc)
             return
 
         embed = base_embed(
             title="Audit Channel Updated",
             color=discord.Color.green(),
-            description="The audit log channel was updated in config.toml and reloaded.",
+            description="The audit log channel was updated for this guild.",
         )
         embed.add_field(name="Guild", value=f"{interaction.guild.name} (`{interaction.guild.id}`)", inline=False)
         embed.add_field(name="Channel", value=f"{channel.mention} (`{channel.id}`)", inline=False)
@@ -11058,7 +12161,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             embed = build_retro_scan_embed(RETRO_SCAN)
             await respond_ephemeral(
                 interaction,
-                content="A retro scan is already running. Use `/spamfighter retro status` to follow it or `/spamfighter retro cancel` to stop it.",
+                content="A retro scan is already running. Use `/sf-retro status` to follow it or `/sf-retro cancel` to stop it.",
                 embed=embed,
             )
             return
@@ -11096,7 +12199,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             await respond_ephemeral(interaction, content=str(exc))
             return
         embed = build_retro_scan_embed(scan)
-        embed.description = "Retro scan started in preview mode. It will only report what would happen. Use `/spamfighter retro status` to check progress."
+        embed.description = "Retro scan started in preview mode. It will only report what would happen. Use `/sf-retro status` to check progress."
         if deep_image_hash_scan:
             embed.description += " Exact known image hashes will also be checked during this scan."
 
@@ -11140,7 +12243,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             embed = build_retro_scan_embed(RETRO_SCAN)
             await respond_ephemeral(
                 interaction,
-                content="A retro scan is already running. Use `/spamfighter retro status` to follow it or `/spamfighter retro cancel` to stop it first.",
+                content="A retro scan is already running. Use `/sf-retro status` to follow it or `/sf-retro cancel` to stop it first.",
                 embed=embed,
             )
             return
@@ -11369,7 +12472,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         channel_5="Optional fifth known-clean text or voice-channel chat",
     )
     @guild_only_check()
-    @guild_admin_or_super_user_only()
+    @guild_administrator_or_control_operator_only()
     async def set_fp_channels(
         self,
         interaction: discord.Interaction,
@@ -11428,7 +12531,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
 
     @reviews.command(name="show-validation-channels", description="Show the known-clean validation channels used before rule deployment.")
     @guild_only_check()
-    @guild_admin_or_super_user_only()
+    @guild_administrator_or_control_operator_only()
     async def show_fp_channels(self, interaction: discord.Interaction) -> None:
         assert interaction.guild is not None
 
@@ -11490,8 +12593,13 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         remember_user_identity(interaction.guild.id, reporter_user)
         remember_user_identity(interaction.guild.id, author_user)
 
+        raw_hash_entries = [value.strip().lower() for value in str(image_hashes or "").split(",") if value.strip()]
         parsed_hashes = trim_unique_list(
-            [value.strip().lower() for value in str(image_hashes or "").split(",") if value.strip()],
+            [value.removeprefix("sha256:") for value in raw_hash_entries if not value.startswith("phash:")],
+            limit=8,
+        )
+        parsed_phashes = trim_unique_list(
+            [value.removeprefix("phash:") for value in raw_hash_entries if value.startswith("phash:")],
             limit=8,
         )
         normalized = normalize_for_scan(text or media_indicators or "")
@@ -11499,6 +12607,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             content=text,
             media_indicators=media_indicators or "",
             image_hashes=parsed_hashes,
+            image_phashes=parsed_phashes,
         )
         report_id = f"test-{utcnow().strftime('%Y%m%d%H%M%S%f')}"
         report = RuleReportState(
@@ -11516,6 +12625,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             normalized_content=normalized,
             media_indicators=media_indicators or "",
             image_hashes=parsed_hashes,
+            image_phashes=parsed_phashes,
             reporter_ids={reporter_user.id},
             current_matched=matched,
             current_reason=reason,
@@ -11618,7 +12728,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             description="spam_rules.toml was reloaded successfully.",
         )
         embed.add_field(name="Artifacts", value=str(len(SPAM_RULES.artifact_values)), inline=True)
-        embed.add_field(name="Image Hashes", value=str(len(SPAM_RULES.image_hashes)), inline=True)
+        embed.add_field(name="Image Hashes", value=f"{len(SPAM_RULES.image_hashes)} sha256 / {len(SPAM_RULES.image_phashes)} phash", inline=True)
         embed.add_field(name="Custom Rules", value=str(len(SPAM_RULES.custom_rules)), inline=True)
         embed.add_field(name="Managed Hooks", value=str(len(MANAGED_RULE_HOOK_NAMES)), inline=True)
         embed.add_field(name="Review Channel", value=f"<#{REPORT_REVIEW_CHANNEL_ID}>" if REPORT_REVIEW_CHANNEL_ID else "Not configured", inline=False)
@@ -11634,7 +12744,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         await audit_control_action(
             interaction,
             "reload-spam-rules",
-            f"Reloaded spam_rules.toml (artifacts={len(SPAM_RULES.artifact_values)}, image_hashes={len(SPAM_RULES.image_hashes)}, custom_rules={len(SPAM_RULES.custom_rules)})",
+            f"Reloaded spam_rules.toml (artifacts={len(SPAM_RULES.artifact_values)}, image_hashes={len(SPAM_RULES.image_hashes)}, image_phashes={len(SPAM_RULES.image_phashes)}, custom_rules={len(SPAM_RULES.custom_rules)})",
         )
 
     @rules.command(name="list", description="Show managed SpamFighter rules from spam_rules.toml.")
@@ -11652,7 +12762,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         embed = base_embed(title="Managed Spam Rules", color=discord.Color.blurple())
         embed.add_field(name="Category", value=category, inline=True)
         embed.add_field(name="Artifacts", value=str(len(SPAM_RULES.artifact_values)), inline=True)
-        embed.add_field(name="Image Hashes", value=str(len(SPAM_RULES.image_hashes)), inline=True)
+        embed.add_field(name="Image Hashes", value=f"{len(SPAM_RULES.image_hashes)} sha256 / {len(SPAM_RULES.image_phashes)} phash", inline=True)
         embed.add_field(name="Custom Rules", value=str(len(SPAM_RULES.custom_rules)), inline=True)
 
         if category == "summary":
@@ -11662,7 +12772,9 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             values = "\n".join(SPAM_RULES.artifact_values) or "None"
             embed.add_field(name="Artifact Values", value=format_embed_field_value(values, limit=900), inline=False)
         elif category == "image_hashes":
-            values = "\n".join(SPAM_RULES.image_hashes) or "None"
+            hash_lines = [f"sha256:{value}" for value in SPAM_RULES.image_hashes]
+            hash_lines.extend(f"phash:{value}" for value in SPAM_RULES.image_phashes)
+            values = "\n".join(hash_lines) or "None"
             embed.add_field(name="Image Hashes", value=format_embed_field_value(values, limit=900, codeblock=True), inline=False)
         elif category == "hooks":
             if hook_name:
@@ -11683,6 +12795,65 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
 
         await respond_ephemeral(interaction, embed=embed)
         await audit_control_action(interaction, "list-rules", f"Viewed spam rules category={category} hook={hook_name or 'none'}")
+
+    @rules.command(name="image-similarity", description="View or set the global perceptual image match threshold.")
+    @app_commands.describe(percent=f"New similarity percent ({IMAGE_SIMILARITY_PERCENT_MIN:g}-{IMAGE_SIMILARITY_PERCENT_MAX:g}). Leave empty to view current value.")
+    @guild_only_check()
+    @control_admin_only()
+    async def image_similarity(
+        self,
+        interaction: discord.Interaction,
+        percent: Optional[float] = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        if percent is not None:
+            if not (IMAGE_SIMILARITY_PERCENT_MIN <= percent <= IMAGE_SIMILARITY_PERCENT_MAX):
+                await interaction.followup.send(
+                    f"`percent` must be between {IMAGE_SIMILARITY_PERCENT_MIN:g} and {IMAGE_SIMILARITY_PERCENT_MAX:g}.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                await set_image_similarity_percent(percent)
+            except Exception as exc:
+                await interaction.followup.send(
+                    f"Could not persist the image similarity threshold to Postgres: {exc}\n"
+                    f"The in-memory value is unchanged ({IMAGE_SIMILARITY_PERCENT:g}%).",
+                    ephemeral=True,
+                )
+                await audit_error(interaction.guild, "Image Similarity Update Failed", "image_similarity.save", exc)
+                return
+
+        max_distance = image_similarity_max_distance(IMAGE_SIMILARITY_PERCENT)
+        embed = base_embed(
+            title="Perceptual Image Match Threshold",
+            color=discord.Color.green() if percent is not None else discord.Color.blurple(),
+            description=(
+                "Perceptual (pHash) image matching flags images whose hash is at least this similar to a known spam image. "
+                "SHA-256 exact matching is unaffected."
+            ),
+        )
+        embed.add_field(name="Similarity Threshold", value=f"{IMAGE_SIMILARITY_PERCENT:g}%", inline=True)
+        embed.add_field(name="Max Hamming Distance", value=f"{max_distance} / {PHASH_BITS} bits", inline=True)
+        embed.add_field(name="pHash Support", value="Available" if is_phash_supported() else "Unavailable (Pillow/ImageHash not installed)", inline=True)
+        embed.add_field(name="Stored SHA-256 Hashes", value=str(len(SPAM_RULES.image_hashes)), inline=True)
+        embed.add_field(name="Stored Perceptual Hashes", value=str(len(SPAM_RULES.image_phashes)), inline=True)
+        if percent is not None:
+            embed.add_field(name="Updated By", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        if percent is not None:
+            await audit_control_action(
+                interaction,
+                "image-similarity",
+                f"Set global image similarity threshold to {IMAGE_SIMILARITY_PERCENT:g}% (max Hamming distance {max_distance}/{PHASH_BITS})",
+            )
+        else:
+            await audit_control_action(
+                interaction,
+                "image-similarity",
+                f"Viewed global image similarity threshold ({IMAGE_SIMILARITY_PERCENT:g}%)",
+            )
 
     @rules.command(name="disable", description="Disable or remove a managed spam rule entry.")
     @app_commands.describe(
@@ -11724,11 +12895,17 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
                 return
 
             if target_type == "image_hash":
-                values = raw.setdefault("image_hashes", {}).setdefault("sha256", [])
-                target_hash = identifier.lower().removeprefix("sha256:")
+                lowered = identifier.lower()
+                if lowered.startswith("phash:"):
+                    hash_key = "phash"
+                    target_hash = lowered.removeprefix("phash:")
+                else:
+                    hash_key = "sha256"
+                    target_hash = lowered.removeprefix("sha256:")
+                values = raw.setdefault("image_hashes", {}).setdefault(hash_key, [])
                 filtered = [value for value in values if str(value).strip().lower() != target_hash]
                 if len(filtered) != len(values):
-                    raw["image_hashes"]["sha256"] = filtered
+                    raw["image_hashes"][hash_key] = filtered
                     result["changed"] = True
                 return
 
@@ -11796,7 +12973,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
         await audit_control_action(interaction, "show-rule-history", f"Viewed {len(backups)} spam rule backups")
 
     @rules.command(name="rollback", description="Restore spam_rules.toml from a recent backup.")
-    @app_commands.describe(backup_name="The backup filename from /spamfighter rules history")
+    @app_commands.describe(backup_name="The backup filename from /sf-rules history")
     @guild_only_check()
     @control_admin_only()
     async def rollback_rule(self, interaction: discord.Interaction, backup_name: str) -> None:
@@ -11858,6 +13035,7 @@ class AdminCog(commands.GroupCog, group_name="spamfighter", group_description="S
             values = list(SPAM_RULES.artifact_values)
         elif target_type == "image_hash":
             values = [f"sha256:{value}" for value in SPAM_RULES.image_hashes]
+            values.extend(f"phash:{value}" for value in SPAM_RULES.image_phashes)
         elif target_type == "hook" and hook_name in MANAGED_RULE_HOOK_NAMES:
             values = list(SPAM_RULES.hooks.get(hook_name, tuple()))
         elif target_type == "custom_rule":

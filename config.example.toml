@@ -18,7 +18,7 @@ rule_deployer_role_ids = []
 require_second_approver_for_ai = true
 
 [guilds]
-allowlist_enabled = true
+allowlist_enabled = false
 allowed_guild_ids = []
 
 [allowlists]
